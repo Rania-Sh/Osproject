@@ -21,7 +21,7 @@ int main(int argc, char **argv) {
     if (!g) return 1;
 
     int path[64];
-    int len = dijkstra(g, 0, n - 1, path);
+    int len = findShortestPath(g, 0, n - 1, path);
 
     if (len == 0) {
         freeGraph(g);
