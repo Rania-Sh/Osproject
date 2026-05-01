@@ -1,4 +1,4 @@
-//
+ //
 // Created by student on 01/05/2026.
 //
 #include "animationui.h"
@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
 
 
 
@@ -47,6 +48,7 @@ void freeGraph(Graph *g) {
 
 
 
+
 void defaultLayout(int n, Point *pos) {
     float cx = 450, cy = 325, r = 220;
 
@@ -76,4 +78,29 @@ bool drawButton(Rectangle rect, const char *label,
              20, fg);
 
     return hover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+}
+int findShortestPath(Graph *g, int src, int dst, int *path) {
+    int n = g->numVertices;
+    int dist[64], prev[64], visited[64];
+    for (int i = 0; i < n; i++) {
+        dist[i] = 1000000; prev[i] = -1; visited[i] = 0;
+    }
+    dist[src] = 0;
+    for (int iter = 0; iter < n; iter++) {
+        int u = -1;
+        for (int i = 0; i < n; i++)
+            if (!visited[i] && (u == -1 || dist[i] < dist[u])) u = i;
+        if (u == -1 || dist[u] == 1000000) break;
+        visited[u] = 1;
+        for (int v = 0; v < n; v++) {
+            if (g->weights[u][v] > 0) {
+                int nd = dist[u] + g->weights[u][v];
+                if (nd < dist[v]) { dist[v] = nd; prev[v] = u; }
+            }
+        }
+    }
+    int tmp[64], len = 0, cur = dst;
+    while (cur != -1) { tmp[len++] = cur; cur = prev[cur]; }
+    for (int i = 0; i < len; i++) path[i] = tmp[len - 1 - i];
+    return (len > 0 && path[0] == src) ? len : 0;
 }
