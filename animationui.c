@@ -44,51 +44,6 @@ void freeGraph(Graph *g) {
 
 
 
-int dijkstra(Graph *g, int src, int dst, int *path) {
-    int n = g->numVertices;
-    int dist[64], prev[64], vis[64];
-
-    for (int i = 0; i < n; i++) {
-        dist[i] = 1e9;
-        prev[i] = -1;
-        vis[i] = 0;
-    }
-
-    dist[src] = 0;
-
-    for (int i = 0; i < n; i++) {
-        int u = -1;
-
-        for (int j = 0; j < n; j++)
-            if (!vis[j] && (u == -1 || dist[j] < dist[u]))
-                u = j;
-
-        if (u == -1) break;
-        vis[u] = 1;
-
-        for (int v = 0; v < n; v++) {
-            if (g->weights[u][v]) {
-                int nd = dist[u] + g->weights[u][v];
-                if (nd < dist[v]) {
-                    dist[v] = nd;
-                    prev[v] = u;
-                }
-            }
-        }
-    }
-
-    int tmp[64], len = 0, cur = dst;
-
-    while (cur != -1) {
-        tmp[len++] = cur;
-        cur = prev[cur];
-    }
-
-    for (int i = 0; i < len; i++)
-        path[i] = tmp[len - i - 1];
-
-    return (path[0] == src) ? len : 0;
-}
 
 
 
