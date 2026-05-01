@@ -16,7 +16,6 @@ Graph *loadGraph(const char *filename, int *numNodes);
 void freeGraph(Graph *g);
 
 
-int dijkstra(Graph *g, int src, int dst, int *path);
 
 
 void defaultLayout(int n, Point *pos);
