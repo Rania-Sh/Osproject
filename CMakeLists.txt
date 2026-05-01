@@ -3,13 +3,15 @@ project(osproject C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(osproject main.c
-        animation.h
+add_executable(osproject
+        main.c
         animation.c
-        animationui.h
         animationui.c
+        dijkstra.c
 )
-#Link raylib
+
+
 find_package(raylib REQUIRED)
-target_link_libraries(osproject raylib m pthread dl)
+
+target_link_libraries(osproject raylib m pthread dl rt X11 GL)
 
