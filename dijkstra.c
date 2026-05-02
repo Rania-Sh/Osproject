@@ -14,41 +14,29 @@ void printPath(int parent[], int j, bool first) {
     printf("->%d", j);
 }
 
-void dijkstra(int graph[MAX_NODES][MAX_NODES], int n, int src, int dest) {
-    int dist[MAX_NODES];
-    bool sptSet[MAX_NODES];
-    int parent[MAX_NODES];
-
+int dijkstra(Graph *g, int src, int dst, int *path) {
+    int n = g->numVertices;
+    int dist[64], prev[64], visited[64];
     for (int i = 0; i < n; i++) {
-        dist[i] = INT_MAX;
-        sptSet[i] = false;
-        parent[i] = -1;
+        dist[i] = 1000000; prev[i] = -1; visited[i] = 0;
     }
-
     dist[src] = 0;
-
-    for (int count = 0; count < n - 1; count++) {
+    for (int iter = 0; iter < n; iter++) {
         int u = -1;
-        for (int v = 0; v < n; v++)
-            if (!sptSet[v] && (u == -1 || dist[v] < dist[u]))
-                u = v;
-
-        if (dist[u] == INT_MAX) break;
-        sptSet[u] = true;
-
+        for (int i = 0; i < n; i++)
+            if (!visited[i] && (u == -1 || dist[i] < dist[u])) u = i;
+        if (u == -1 || dist[u] == 1000000) break;
+        visited[u] = 1;
         for (int v = 0; v < n; v++) {
-            if (!sptSet[v] && graph[u][v] != -1 && dist[u] + graph[u][v] < dist[v]) {
-                parent[v] = u;
-                dist[v] = dist[u] + graph[u][v];
+            if (g->weights[u][v] > 0) {
+                int nd = dist[u] + g->weights[u][v];
+                if (nd < dist[v]) { dist[v] = nd; prev[v] = u; }
             }
         }
     }
-
-    if (dist[dest] == INT_MAX) {
-        printf("No path found\n");
-    } else {
-        printPath(parent, dest, true);
-        printf("\n%d\n", dist[dest]);
-    }
+    int tmp[64], len = 0, cur = dst;
+    while (cur != -1) { tmp[len++] = cur; cur = prev[cur]; }
+    for (int i = 0; i < len; i++) path[i] = tmp[len - 1 - i];
+    return (len > 0 && path[0] == src) ? len : 0;
 }
 
