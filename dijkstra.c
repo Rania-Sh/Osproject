@@ -2,9 +2,9 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <stdbool.h>
-
+#include "animation.h"
 #define MAX_NODES 100
-
+int dijkstra(Graph *g, int src, int dst, int *path);
 void printPath(int parent[], int j, bool first) {
     if (parent[j] == -1) {
         printf("%d", j);
