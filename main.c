@@ -2,12 +2,17 @@
 #include "animationui.h"
 #include "animation.h"
 #include <stdio.h>
-
 #include <math.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <sys/wait.h>
 
 int dijkstra(Graph *g, int src, int dst, int *path);
 #define SCREEN_W 900
 #define SCREEN_H 650
+#define MAX_TRAVELERS 16
 
 typedef enum {
     STATE_IDLE,
@@ -16,55 +21,122 @@ typedef enum {
     STATE_FINISHED
 } AnimState;
 
+
+static Color TRAVELER_COLORS[MAX_TRAVELERS] = {
+    {220,  50,  50, 255}, 
+    { 50, 200,  50, 255},  
+    { 50, 130, 255, 255}, 
+    {255, 200,   0, 255},  
+    {200,  50, 220, 255},  
+    {  0, 220, 200, 255},  
+    {255, 130,   0, 255}, 
+    {255, 100, 180, 255}, 
+    {100, 255, 130, 255},  
+    {130, 180, 255, 255},  
+    {255,  80,  80, 255},
+    { 80, 255, 255, 255},
+    {255, 255,  80, 255},
+    {180,  80, 255, 255},
+    {255, 180,  80, 255},
+    { 80, 255, 180, 255},
+};
+
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color);
 
 int main(int argc, char **argv) {
-    if (argc < 2) return 1;
-
-    int n;
-    Graph *g = loadGraph(argv[1], &n);
-    if (!g) return 1;
-
-    int path[64];
-    int len = dijkstra(g, 0, n - 1, path);
-
-    if (len == 0) {
-        freeGraph(g);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
         return 1;
     }
 
+   
+    int n;
+    int numTravelers;
+    int sources[MAX_TRAVELERS], dests[MAX_TRAVELERS];
+
+    Graph *g = loadGraphAndTravelers(argv[1], &n, &numTravelers, sources, dests);
+    if (!g) {
+        fprintf(stderr, "Failed to load graph from %s\n", argv[1]);
+        return 1;
+    }
+
+    int   paths[MAX_TRAVELERS][64];
+    int   pathLens[MAX_TRAVELERS];
     Point pos[64];
     defaultLayout(n, pos);
 
-    AnimationPath *anim = buildAnimationPath(g, path, len, pos);
+    AnimationPath *anims[MAX_TRAVELERS];
+    Point          agents[MAX_TRAVELERS];
 
-    InitWindow(SCREEN_W, SCREEN_H, "Graph Animation System");
+    for (int t = 0; t < numTravelers; t++) {
+        pathLens[t] = dijkstra(g, sources[t], dests[t], paths[t]);
+        if (pathLens[t] == 0) {
+            fprintf(stderr, "No path for traveler %d (%d->%d)\n",
+                    t, sources[t], dests[t]);
+            freeGraph(g);
+            return 1;
+        }
+        anims[t]  = buildAnimationPath(g, paths[t], pathLens[t], pos);
+        agents[t] = pos[paths[t][0]];
+    }
+
+ 
+    pid_t childPids[MAX_TRAVELERS];
+
+    for (int t = 0; t < numTravelers; t++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork failed");
+            freeGraph(g);
+            return 1;
+        }
+        if (pid == 0) {
+        
+            printf("[%d] started\n", getpid());
+            fflush(stdout);
+            
+            while (1) pause();
+            exit(0);
+        }
+     
+        childPids[t] = pid;
+    }
+
+   
+    InitWindow(SCREEN_W, SCREEN_H, "Graph Animation System - Multi Traveler");
     SetTargetFPS(60);
 
     AnimState state = STATE_IDLE;
-    Point agent = pos[path[0]];
+    bool finished[MAX_TRAVELERS];
+    bool signalSent[MAX_TRAVELERS];
+    for (int t = 0; t < numTravelers; t++) {
+        finished[t]   = false;
+        signalSent[t] = false;
+    }
 
-    Rectangle btnAction = { 25, 25, 120, 40 };
-    Rectangle btnRestart = { 25, 75, 120, 40 };
+    Rectangle btnAction  = {  25, 25, 120, 40 };
+    Rectangle btnRestart = {  25, 75, 120, 40 };
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
-        Vector2 mousePos = GetMousePosition();
-
-        bool hoverAction = CheckCollisionPointRec(mousePos, btnAction);
-        bool hoverRestart = CheckCollisionPointRec(mousePos, btnRestart);
+        Vector2 mousePos    = GetMousePosition();
+        bool hoverAction    = CheckCollisionPointRec(mousePos, btnAction);
+        bool hoverRestart   = CheckCollisionPointRec(mousePos, btnRestart);
 
         if (state == STATE_RUNNING) {
-            if (drawButton(btnAction, "Stop", ORANGE, WHITE, hoverAction)) {
+            if (drawButton(btnAction, "Stop", ORANGE, WHITE, hoverAction))
                 state = STATE_PAUSED;
-            }
         } else {
             if (drawButton(btnAction, "Play", LIME, DARKGRAY, hoverAction)) {
                 if (state == STATE_FINISHED) {
-                    anim->currentStep = 0;
-                    anim->elapsed = 0.0f;
-                    anim->finished = false;
-                    agent = pos[path[0]];
+                   
+                    for (int t = 0; t < numTravelers; t++) {
+                        anims[t]->currentStep = 0;
+                        anims[t]->elapsed     = 0.0f;
+                        anims[t]->finished    = false;
+                        agents[t]             = pos[paths[t][0]];
+                        finished[t]           = false;
+                    }
                 }
                 state = STATE_RUNNING;
             }
@@ -72,160 +144,145 @@ int main(int argc, char **argv) {
 
         if (drawButton(btnRestart, "Restart", MAROON, WHITE, hoverRestart)) {
             state = STATE_IDLE;
-            anim->currentStep = 0;
-            anim->elapsed = 0.0f;
-            anim->finished = false;
-            agent = pos[path[0]];
+            for (int t = 0; t < numTravelers; t++) {
+                anims[t]->currentStep = 0;
+                anims[t]->elapsed     = 0.0f;
+                anims[t]->finished    = false;
+                agents[t]             = pos[paths[t][0]];
+                finished[t]           = false;
+            }
         }
 
+       
         if (state == STATE_RUNNING) {
-            updateAnimation(anim, dt, &agent);
-            if (anim->finished) state = STATE_FINISHED;
+            int allDone = 1;
+            for (int t = 0; t < numTravelers; t++) {
+                if (!finished[t]) {
+                    updateAnimation(anims[t], dt, &agents[t]);
+                    if (anims[t]->finished) {
+                        finished[t] = true;
+                        
+                        if (!signalSent[t]) {
+                            kill(childPids[t], SIGTERM);
+                            signalSent[t] = true;
+                        }
+                    }
+                    allDone = 0;
+                }
+            }
+            if (allDone) state = STATE_FINISHED;
         }
 
+      
         BeginDrawing();
         ClearBackground((Color){ 20, 30, 45, 255 });
 
+    
         for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                if (g->weights[i][j] > 0 && i < j) {
-
+            for (int j = i + 1; j < n; j++) {
+                if (g->weights[i][j] > 0) {
                     Vector2 start = { pos[i].x, pos[i].y };
-                    Vector2 end = { pos[j].x, pos[j].y };
-
-                    // Draw the normal edge
+                    Vector2 end   = { pos[j].x, pos[j].y };
                     DrawArrowLine(start, end, 1.5f, Fade(LIGHTGRAY, 0.5f));
 
-                    // Calculate edge direction
-                    float dx = end.x - start.x;
-                    float dy = end.y - start.y;
-                    float length = sqrtf(dx * dx + dy * dy);
-
-                    // Calculate the middle of the edge
+                    float dx = end.x - start.x, dy = end.y - start.y;
+                    float len = sqrtf(dx*dx + dy*dy);
                     float midX = (start.x + end.x) / 2.0f;
                     float midY = (start.y + end.y) / 2.0f;
+                    float ox = (len != 0.0f) ? -dy/len * 22.0f : 0.0f;
+                    float oy = (len != 0.0f) ?  dx/len * 22.0f : 0.0f;
 
-                    // Move the weight slightly away from the edge
-                    float offsetX = 0.0f;
-                    float offsetY = 0.0f;
-
-                    if (length != 0.0f) {
-                        offsetX = -dy / length * 22.0f;
-                        offsetY =  dx / length * 22.0f;
-                    }
-
-                    // Prepare weight text
-                    const char *weightText = TextFormat("%d", g->weights[i][j]);
-                    int fontSize = 18;
-                    int textWidth = MeasureText(weightText, fontSize);
-
-                    float textX = midX + offsetX - textWidth / 2.0f;
-                    float textY = midY + offsetY - fontSize / 2.0f;
-
-                    // Draw dark background behind the weight
-                    DrawRectangle(
-                        textX - 5,
-                        textY - 3,
-                        textWidth + 10,
-                        fontSize + 6,
-                        Fade(BLACK, 0.75f)
-                    );
-
-                    // Draw the weight
-                    DrawText(weightText, textX, textY, fontSize, YELLOW);
+                    const char *wt = TextFormat("%d", g->weights[i][j]);
+                    int fs = 18, tw = MeasureText(wt, fs);
+                    DrawRectangle(midX+ox-tw/2-5, midY+oy-fs/2-3, tw+10, fs+6, Fade(BLACK,0.75f));
+                    DrawText(wt, midX+ox-tw/2, midY+oy-fs/2, fs, YELLOW);
                 }
             }
         }
-        for (int k = 0; k < len - 1; k++) {
-            int from = path[k];
-            int to = path[k + 1];
 
-            Vector2 start = { pos[from].x, pos[from].y };
-            Vector2 end = { pos[to].x, pos[to].y };
-
-            DrawArrowLine(start, end, 8.0f, DARKBLUE);
-            DrawArrowLine(start, end, 5.0f, SKYBLUE);
+      
+        for (int t = 0; t < numTravelers; t++) {
+            Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
+            Color dark = Fade(col, 0.4f);
+            for (int k = 0; k < pathLens[t] - 1; k++) {
+                int from = paths[t][k], to = paths[t][k+1];
+                Vector2 start = { pos[from].x, pos[from].y };
+                Vector2 end   = { pos[to].x,   pos[to].y   };
+                DrawArrowLine(start, end, 7.0f, dark);
+                DrawArrowLine(start, end, 4.0f, col);
+            }
         }
 
+     
         for (int i = 0; i < n; i++) {
             DrawCircle(pos[i].x, pos[i].y, 20, RAYWHITE);
             DrawCircleLines(pos[i].x, pos[i].y, 15, LIGHTGRAY);
             DrawText(TextFormat("%d", i), pos[i].x - 6, pos[i].y - 8, 18, BLACK);
         }
 
-        Vector2 agentPos = { agent.x, agent.y };
+        
+        for (int t = 0; t < numTravelers; t++) {
+            Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
+            Vector2 ap = { agents[t].x, agents[t].y };
+            DrawCircleV(ap, 20, Fade(col, 0.25f));
+            DrawCircleV(ap, 13, col);
+            DrawCircleLinesV(ap, 15, WHITE);
+            DrawText(TextFormat("%d", t), ap.x - 4, ap.y - 8, 14, BLACK);
+        }
 
-        DrawCircleV(agentPos, 20, Fade(PURPLE, 0.25f));
-        DrawCircleV(agentPos, 13, MAROON);
-        DrawCircleLinesV(agentPos, 15, WHITE);
+        
+        for (int t = 0; t < numTravelers; t++) {
+            Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
+            int legendY = 25 + t * 28;
+            DrawCircle(SCREEN_W - 130, legendY + 10, 10, col);
+            DrawText(TextFormat("T%d: %d->%d [PID:%d]",
+                                t, sources[t], dests[t], (int)childPids[t]),
+                     SCREEN_W - 115, legendY, 14, col);
+        }
 
-        if (state == STATE_RUNNING) DrawText("STATUS: RUNNING", 160, 35, 18, LIME);
-        else if (state == STATE_PAUSED)  DrawText("STATUS: PAUSED", 160, 35, 18, ORANGE);
+       
+        if (state == STATE_RUNNING)
+            DrawText("STATUS: RUNNING",  160, 35, 18, LIME);
+        else if (state == STATE_PAUSED)
+            DrawText("STATUS: PAUSED",   160, 35, 18, ORANGE);
         else if (state == STATE_FINISHED) {
             DrawText("STATUS: FINISHED", 160, 35, 18, SKYBLUE);
-            DrawText("Destination Reached!", 320, 585, 28, RAYWHITE);
-        }
-        else DrawText("STATUS: READY", 160, 35, 18, LIGHTGRAY);
+            DrawText("All Travelers Reached Destination!", 220, 585, 24, RAYWHITE);
+        } else
+            DrawText("STATUS: READY",    160, 35, 18, LIGHTGRAY);
 
         EndDrawing();
     }
 
-    freeAnimationPath(anim);
+    
+    for (int t = 0; t < numTravelers; t++) {
+        if (!signalSent[t]) kill(childPids[t], SIGTERM);
+        waitpid(childPids[t], NULL, 0);
+    }
+
+    
+    for (int t = 0; t < numTravelers; t++)
+        freeAnimationPath(anims[t]);
     freeGraph(g);
     CloseWindow();
     return 0;
-
 }
-void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color)
-{
-    // Draw the main line
+
+
+void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color) {
     DrawLineEx(start, end, thickness, color);
-
-    float dx = end.x - start.x;
-    float dy = end.y - start.y;
-    float length = sqrtf(dx * dx + dy * dy);
-
-    if (length == 0.0f) {
-        return;
-    }
-
-    // Direction from start to end
-    float ux = dx / length;
-    float uy = dy / length;
-
-    // Move arrow head away from the node center
+    float dx = end.x - start.x, dy = end.y - start.y;
+    float length = sqrtf(dx*dx + dy*dy);
+    if (length == 0.0f) return;
+    float ux = dx/length, uy = dy/length;
     float nodeRadius = 23.0f;
-
-    Vector2 tip = {
-        end.x - ux * nodeRadius,
-        end.y - uy * nodeRadius
-    };
-
-    // Arrow size
-    float arrowLength = 18.0f;
-    float arrowWidth = 10.0f;
-
-    // Base point behind the tip
-    Vector2 base = {
-        tip.x - ux * arrowLength,
-        tip.y - uy * arrowLength
-    };
-
-    // Perpendicular direction
-    float px = -uy;
-    float py = ux;
-
-    Vector2 left = {
-        base.x + px * arrowWidth,
-        base.y + py * arrowWidth
-    };
-
-    Vector2 right = {
-        base.x - px * arrowWidth,
-        base.y - py * arrowWidth
-    };
-
-    // Draw arrow head using two lines
-    DrawLineEx(tip, left, thickness + 1.5f, color);
-    DrawLineEx(tip, right, thickness + 1.5f, color);
+    Vector2 tip  = { end.x - ux*nodeRadius, end.y - uy*nodeRadius };
+    float arrowLength = 18.0f, arrowWidth = 10.0f;
+    Vector2 base = { tip.x - ux*arrowLength, tip.y - uy*arrowLength };
+    float px = -uy, py = ux;
+    Vector2 left  = { base.x + px*arrowWidth, base.y + py*arrowWidth };
+    Vector2 right = { base.x - px*arrowWidth, base.y - py*arrowWidth };
+    DrawLineEx(tip, left,  thickness+1.5f, color);
+    DrawLineEx(tip, right, thickness+1.5f, color);
 }
+
