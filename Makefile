@@ -11,6 +11,8 @@ milestone1:
 milestone2: milestone3
 milestone3:
 	$(CC) $(CFLAGS) main.c animation.c animationui.c -o sim $(LIBS)
+milestone4:
+	$(CC) $(CFLAGS) main.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
 
 # Clean up
 clean:
