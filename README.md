@@ -104,6 +104,7 @@ make milestone3
 
 # ניקוי קבצי הבנייה
 make clean
+```
 
 ## Milestone 5 – IPC (Pipes)
 
