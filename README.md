@@ -104,3 +104,23 @@ make milestone3
 
 # ניקוי קבצי הבנייה
 make clean
+
+## Milestone 5 – IPC (Pipes)
+
+### Compile:
+make milestone5
+
+### Run:
+./sim test_graph.txt
+
+### Description:
+Each child process independently reads the graph file and computes its own
+Dijkstra path. It then travels node-by-node, sending a small struct message
+to the parent over a dedicated pipe after each arrival.
+The parent reads these messages non-blockingly inside the raylib GUI loop,
+prints the log, and updates each traveler's dot on screen.
+
+### IPC choice: pipes
+Pipes were chosen for their simplicity and zero-setup overhead.
+One pipe per child (child writes, parent reads). The read end is set to
+O_NONBLOCK so the GUI loop never blocks waiting for a child message.
