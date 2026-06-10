@@ -18,7 +18,7 @@ int dijkstra(Graph *g, int src, int dst, int *path);
 #define SCREEN_W     900
 #define SCREEN_H     650
 #define MAX_TRAVELERS 16
-#define NODE_TRAVEL_USEC 2000000
+#define NODE_TRAVEL_USEC 1500000
 
 #define MAX_NODES 64
 #define SEM_NAME_LEN 64
@@ -82,6 +82,8 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
     int n;
     Graph *g = loadGraph(filename, &n);
     if (!g) {
+        Msg fin = { MSG_FINISHED, -2, -1 };
+        write(writeFd, &fin, sizeof(Msg));
         close(writeFd);
         exit(1);
     }
@@ -91,67 +93,89 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
     freeGraph(g);
 
     if (pathLen == 0) {
+        Msg fin = { MSG_FINISHED, -2, -1 };
+        write(writeFd, &fin, sizeof(Msg));
         close(writeFd);
-        exit(1);
+        exit(0);
     }
 
-    /* Travel: send a message for each node arrival */
-    /* Travel: send a message for each node arrival */
     /* Travel with node synchronization */
     for (int i = 0; i < pathLen; i++) {
         int node = path[i];
         int next = (i + 1 < pathLen) ? path[i + 1] : -1;
 
-        char semName[SEM_NAME_LEN];
-        make_sem_name(semName, node);
+        sem_t *nodeSem = NULL;
 
-        sem_t *nodeSem = sem_open(semName, 0);
-        if (nodeSem == SEM_FAILED) {
-            perror("child sem_open");
-            close(writeFd);
-            exit(1);
-        }
+        /*
+         * Do not lock the source node.
+         * The traveler starts there, so synchronization is applied only
+         * to nodes reached during the trip.
+         */
+        if (i > 0) {
+            char semName[SEM_NAME_LEN];
+            make_sem_name(semName, node);
 
-        /* Tell parent: I am waiting outside this node */
-        /* Try to enter the node immediately */
-        if (sem_trywait(nodeSem) == -1) {
-            if (errno == EAGAIN) {
-                /* Node is busy: tell parent that this traveler is waiting */
-                Msg waitingMsg = { MSG_WAITING, node, next };
-                write(writeFd, &waitingMsg, sizeof(Msg));
-
-                /* Now really wait until the node becomes free */
-                sem_wait(nodeSem);
-            } else {
-                perror("sem_trywait");
-                sem_close(nodeSem);
+            nodeSem = sem_open(semName, 0);
+            if (nodeSem == SEM_FAILED) {
+                perror("child sem_open");
+                Msg fin = { MSG_FINISHED, -2, -1 };
+                write(writeFd, &fin, sizeof(Msg));
                 close(writeFd);
                 exit(1);
             }
+
+            /* Try to enter immediately */
+            if (sem_trywait(nodeSem) == -1) {
+                if (errno == EAGAIN) {
+                    /* Node is busy: notify parent that this traveler is waiting */
+                    Msg waitingMsg = { MSG_WAITING, node, next };
+                    write(writeFd, &waitingMsg, sizeof(Msg));
+
+                    /* Wait until the node becomes free */
+                    sem_wait(nodeSem);
+                } else {
+                    perror("sem_trywait");
+                    sem_close(nodeSem);
+
+                    Msg fin = { MSG_FINISHED, -2, -1 };
+                    write(writeFd, &fin, sizeof(Msg));
+                    close(writeFd);
+                    exit(1);
+                }
+            }
         }
 
-        /* Now the traveler is inside the node */
+        /* Traveler is now inside the node */
         Msg enteredMsg = { MSG_ENTERED, node, next };
         write(writeFd, &enteredMsg, sizeof(Msg));
-        /* Stay inside the node for one full second */
-        sleep(1);
 
-        /* Leave the node */
-        sem_post(nodeSem);
-        sem_close(nodeSem);
+        /*
+         * Stay one full second only inside nodes reached during the trip,
+         * not at the initial source node.
+         */
+        if (i > 0) {
+            sleep(1);
+            sem_post(nodeSem);
+            sem_close(nodeSem);
+        }
 
-        /* Travel on the edge to the next node */
-        if (next != -1)
-            usleep(NODE_TRAVEL_USEC);
+        /* Small travel delay before next node */
+        if (next != -1) {
+            if (i == 0) {
+                usleep(800000);   // only after the source node, to avoid frozen start
+            } else {
+                usleep(NODE_TRAVEL_USEC);   // normal travel delay for the rest
+            }
+        }
     }
 
     /* Signal fully finished */
     Msg fin = { MSG_FINISHED, -2, -1 };
     write(writeFd, &fin, sizeof(Msg));
+
     close(writeFd);
     exit(0);
 }
-
 /* ────────────────────────────────────────────────────────────────────────
  * PARENT / MAIN
  * ──────────────────────────────────────────────────────────────────────── */
@@ -234,8 +258,7 @@ travelers[t].dst        = dests[t];
 travelers[t].curNode    = sources[t];
 travelers[t].done       = false;
 
-travelers[t].waiting     = false;
-travelers[t].waitingNode = -1;
+
         travelers[t].waiting     = false;
         travelers[t].waitingNode = -1;
 
@@ -288,6 +311,10 @@ travelers[t].waitingNode = -1;
                         travelers[t].waiting = true;
                         travelers[t].waitingNode = m.node;
 
+                        printf("[PID=%d] waiting outside node %d\n",
+                               (int)travelers[t].pid, m.node);
+                        fflush(stdout);
+
                     } else if (m.type == MSG_ENTERED) {
                         /* child entered the node - start smooth movement in GUI */
                         travelers[t].waiting = false;
@@ -314,7 +341,6 @@ travelers[t].waitingNode = -1;
                         }
 
                         fflush(stdout);
-
                     }
                 }
                 /* EAGAIN / EWOULDBLOCK = no message yet, that's fine */
@@ -393,6 +419,7 @@ travelers[t].waitingNode = -1;
 
         /* travelers (dots at last reported node) */
         /* travelers */
+        /* travelers */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             Vector2 ap = { guiPos[t].x, guiPos[t].y };
@@ -400,23 +427,27 @@ travelers[t].waitingNode = -1;
             if (travelers[t].waiting) {
                 Point nodePos = pos[travelers[t].waitingNode];
 
-                float offsetX = 28.0f + (t % 3) * 10.0f;
-                float offsetY = -28.0f - (t % 3) * 10.0f;
+                float offsetX = ((t % 3) - 1) * 22.0f;
+                float offsetY = -42.0f;
 
                 ap.x = nodePos.x + offsetX;
                 ap.y = nodePos.y + offsetY;
 
-                DrawCircleV(ap, 22, Fade(ORANGE, 0.30f));
-                DrawCircleV(ap, 13, ORANGE);
-                DrawCircleLinesV(ap, 15, WHITE);
-                DrawText("WAIT", ap.x + 15, ap.y - 8, 12, ORANGE);
+                Vector2 nodeCenter = { nodePos.x, nodePos.y };
+
+                DrawLineEx(nodeCenter, ap, 2.0f, Fade(ORANGE, 0.55f));
+                DrawCircleV(ap, 24, Fade(ORANGE, 0.35f));
+                DrawCircleV(ap, 15, ORANGE);
+                DrawCircleLinesV(ap, 17, WHITE);
+
+                DrawText("WAIT", (int)(ap.x - 18), (int)(ap.y - 34), 14, ORANGE);
             } else {
                 DrawCircleV(ap, 20, Fade(col, 0.25f));
                 DrawCircleV(ap, 13, col);
                 DrawCircleLinesV(ap, 15, WHITE);
             }
 
-            DrawText(TextFormat("%d", t), ap.x - 4, ap.y - 8, 14, BLACK);
+            DrawText(TextFormat("%d", t), (int)(ap.x - 4), (int)(ap.y - 8), 14, BLACK);
         }
 
         /* legend */
@@ -425,10 +456,10 @@ travelers[t].waitingNode = -1;
             int legendY = 25 + t * 28;
             DrawCircle(SCREEN_W - 130, legendY + 10, 10, col);
             DrawText(TextFormat("T%d: %d->%d [PID:%d]%s",
-                                t, travelers[t].src, travelers[t].dst,
-                                (int)travelers[t].pid,
-                                travelers[t].done ? " DONE" : ""),
-                     SCREEN_W - 115, legendY, 14, col);
+                    t, travelers[t].src, travelers[t].dst,
+                    (int)travelers[t].pid,
+                    travelers[t].done ? " DONE" : (travelers[t].waiting ? " WAITING" : "")),
+         SCREEN_W - 115, legendY, 14, travelers[t].waiting ? ORANGE : col);
         }
 
         /* status */
