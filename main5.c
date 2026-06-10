@@ -18,8 +18,7 @@ int dijkstra(Graph *g, int src, int dst, int *path);
 #define SCREEN_W     900
 #define SCREEN_H     650
 #define MAX_TRAVELERS 16
-#define NODE_TRAVEL_USEC 800000   /* 0.8 s per node hop in child */
-
+#define NODE_TRAVEL_USEC 2000000
 /* ── IPC message ── */
 typedef struct {
     int node;      /* current node (-2 = child finished) */
@@ -33,9 +32,14 @@ typedef struct {
     int    src, dst;
     int    curNode;      /* last reported node        */
     bool   done;
-    /* For GUI: we lerp to the node position when we get a message */
+
     Point  guiPos;
+
+    int    fromNode;
     int    targetNode;
+    float  moveStartTime;
+    float  moveDuration;
+    bool   moving;
 } TravelerState;
 
 /* ── colors ── */
@@ -152,15 +156,20 @@ int main(int argc, char **argv) {
         /* make read end non-blocking so GUI loop doesn't stall */
         int flags = fcntl(pipeFds[t][0], F_GETFL, 0);
         fcntl(pipeFds[t][0], F_SETFL, flags | O_NONBLOCK);
-
         travelers[t].pid        = pid;
         travelers[t].readFd     = pipeFds[t][0];
         travelers[t].src        = sources[t];
         travelers[t].dst        = dests[t];
         travelers[t].curNode    = sources[t];
         travelers[t].done       = false;
+
         travelers[t].guiPos     = pos[sources[t]];
-        travelers[t].targetNode = sources[t];
+
+        travelers[t].fromNode      = sources[t];
+        travelers[t].targetNode    = sources[t];
+        travelers[t].moveStartTime = 0.0f;
+        travelers[t].moveDuration  = 1.5f;
+        travelers[t].moving        = false;
     }
 
     /* ── raylib window ── */
@@ -193,12 +202,22 @@ int main(int argc, char **argv) {
                         travelers[t].done = true;
                         doneCount++;
                         close(travelers[t].readFd);
-                        if (doneCount == numTravelers)
-                            state = STATE_FINISHED;
+                        // if (doneCount == numTravelers)
+                        //     state = STATE_FINISHED;
                     } else {
-                        /* arrived at node */
-                        guiPos[t] = pos[m.node];
+                        /* arrived at node - start smooth movement in GUI */
+                        if (travelers[t].curNode != m.node) {
+                            travelers[t].fromNode = travelers[t].curNode;
+                            travelers[t].targetNode = m.node;
+                            travelers[t].moveStartTime = GetTime();
+                            travelers[t].moveDuration = 1.5f;
+                            travelers[t].moving = true;
+                        } else {
+                            guiPos[t] = pos[m.node];
+                        }
+
                         travelers[t].curNode = m.node;
+
                         if (m.nextNode == -1) {
                             printf("[PID=%d] arrived at node %d | DESTINATION\n",
                                    (int)travelers[t].pid, m.node);
@@ -206,6 +225,7 @@ int main(int argc, char **argv) {
                             printf("[PID=%d] arrived at node %d | next node: %d\n",
                                    (int)travelers[t].pid, m.node, m.nextNode);
                         }
+
                         fflush(stdout);
                     }
                 }
@@ -213,6 +233,42 @@ int main(int argc, char **argv) {
             }
         }
 
+        //* ── update smooth GUI movement ── */
+        for (int t = 0; t < numTravelers; t++) {
+            if (travelers[t].moving) {
+                float elapsed = GetTime() - travelers[t].moveStartTime;
+                float alpha = elapsed / travelers[t].moveDuration;
+
+                if (alpha >= 1.0f) {
+                    alpha = 1.0f;
+                    travelers[t].moving = false;
+                }
+
+                Point a = pos[travelers[t].fromNode];
+                Point b = pos[travelers[t].targetNode];
+
+                guiPos[t].x = a.x + (b.x - a.x) * alpha;
+                guiPos[t].y = a.y + (b.y - a.y) * alpha;
+            }
+        }
+        if (state == STATE_RUNNING && doneCount == numTravelers) {
+            bool allAtDestinations = true;
+            bool anyMoving = false;
+
+            for (int t = 0; t < numTravelers; t++) {
+                if (travelers[t].curNode != travelers[t].dst) {
+                    allAtDestinations = false;
+                }
+
+                if (travelers[t].moving) {
+                    anyMoving = true;
+                }
+            }
+
+            if (allAtDestinations && !anyMoving) {
+                state = STATE_FINISHED;
+            }
+        }
         /* ── draw ── */
         BeginDrawing();
         ClearBackground((Color){ 20, 30, 45, 255 });
