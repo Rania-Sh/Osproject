@@ -34,7 +34,6 @@ Graph *loadGraph(const char *filename, int *numNodes) {
         if (line[0] == '#' || line[0] == '\n') break;
         if (sscanf(line, "%d %d %d", &a, &b, &w) == 3) {
             g->weights[a][b] = w;
-            g->weights[b][a] = w;
         }
     }
     fclose(f);
