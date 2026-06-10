@@ -121,6 +121,143 @@ to the parent over a dedicated pipe after each arrival.
 The parent reads these messages non-blockingly inside the raylib GUI loop,
 prints the log, and updates each traveler's dot on screen.
 
+
+
+
+# Milestone 6 – My Work Explanation
+
+## Overview
+
+In this milestone, I worked on adding synchronization between travelers in the graph simulation.
+
+The project was already working up to Milestone 5, where each traveler runs as a separate child process, calculates its own shortest path using Dijkstra, and communicates with the parent process using pipes.
+
+My work in Milestone 6 was to extend that behavior so that travelers cannot enter the same graph node at the same time.
+
+---
+
+## Files I Worked On
+
+### `main6.c`
+
+I created and worked on `main6.c` as the implementation file for Milestone 6.
+
+This file is based on the working Milestone 5 logic, but I added synchronization logic using POSIX named semaphores.
+
+### `Makefile`
+
+I added a new build target:
+
+```makefile
+milestone6:
+	$(CC) $(CFLAGS) main6.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
+```
+
+This allows Milestone 6 to be built using:
+
+```bash
+make milestone6
+```
+
+### `test_graph_milestone6.txt`
+
+I added a special test graph file for Milestone 6.
+
+This file creates a situation where three travelers move toward the same shared node. This makes the synchronization behavior visible in the GUI, because some travelers must wait outside the occupied node.
+
+---
+
+## IPC Used
+
+The project continues to use pipes as the IPC mechanism.
+
+Each child process sends messages to the parent process through a pipe. The parent receives these messages and updates the GUI.
+
+The messages include:
+
+* `MSG_ENTERED`: the traveler entered a node.
+* `MSG_WAITING`: the traveler is waiting outside a busy node.
+* `MSG_FINISHED`: the traveler finished its path.
+
+The parent process is responsible for printing the logs and updating the visual state of each traveler.
+
+---
+
+## Synchronization Method
+
+For synchronization, I used POSIX named semaphores.
+
+Each graph node has one semaphore. The semaphore is initialized with value `1`, which means only one traveler can enter that node at a time.
+
+Before a traveler enters a node, it tries to acquire the semaphore for that node.
+
+If the node is free, the traveler enters it.
+
+If the node is already occupied, the traveler sends a `MSG_WAITING` message to the parent and waits until the semaphore becomes available.
+
+After entering the node, the traveler stays inside it for one second using:
+
+```c
+sleep(1);
+```
+
+Then the traveler releases the semaphore so another waiting traveler can enter.
+
+---
+
+## Waiting State in the GUI
+
+I added a visible waiting state in the GUI.
+
+When a traveler is waiting outside an occupied node:
+
+* The traveler is shown in orange.
+* A `WAIT` label is displayed.
+* The traveler is drawn near the node it is waiting for.
+
+This makes the synchronization behavior clear during the simulation.
+
+---
+
+## How to Build and Run
+
+To build Milestone 6:
+
+```bash
+make clean
+make milestone6
+```
+
+To run the Milestone 6 demonstration file:
+
+```bash
+./sim test_graph_milestone6.txt
+```
+
+This test file shows three travelers reaching the same shared node, where only one traveler enters at a time and the others wait.
+
+---
+
+## What This Demonstrates
+
+This milestone demonstrates:
+
+* Multi-process execution using `fork()`.
+* IPC using pipes.
+* Node-level synchronization using POSIX named semaphores.
+* Preventing more than one traveler from being inside the same node at the same time.
+* Displaying waiting travelers visually in the GUI.
+* Preserving the parent process as the controller of the GUI and logs.
+
+---
+
+## Notes
+
+The original Milestone 5 behavior is preserved in `main5.c`.
+
+Milestone 6 is implemented separately in `main6.c` so that the previous milestone remains available and unchanged.
+
+بpd
 ### IPC choice: pipes
 Pipes were chosen for their simplicity and zero-setup overhead.
 One pipe per child (child writes, parent reads). The read end is set to
