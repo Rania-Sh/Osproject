@@ -1,7 +1,6 @@
 #include "raylib.h"
 #include "animationui.h"
 #include "animation.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +9,8 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
-
+#include <semaphore.h>
+#include <errno.h>
 /* ── external declarations ── */
 int dijkstra(Graph *g, int src, int dst, int *path);
 
@@ -19,19 +19,32 @@ int dijkstra(Graph *g, int src, int dst, int *path);
 #define SCREEN_H     650
 #define MAX_TRAVELERS 16
 #define NODE_TRAVEL_USEC 2000000
+
+#define MAX_NODES 64
+#define SEM_NAME_LEN 64
 /* ── IPC message ── */
+typedef enum {
+    MSG_WAITING = 1,
+    MSG_ENTERED = 2,
+    MSG_FINISHED = 3
+} MsgType;
+
 typedef struct {
-    int node;      /* current node (-2 = child finished) */
-    int nextNode;  /* next node (-1 = DESTINATION)       */
+    MsgType type;
+    int node;
+    int nextNode;
 } Msg;
 
 /* ── per-traveler state kept by parent ── */
 typedef struct {
     pid_t  pid;
-    int    readFd;       /* parent's read end of pipe */
+    int    readFd;
     int    src, dst;
-    int    curNode;      /* last reported node        */
+    int    curNode;
     bool   done;
+
+    bool   waiting;
+    int    waitingNode;
 
     Point  guiPos;
 
@@ -57,6 +70,10 @@ static Color TRAVELER_COLORS[MAX_TRAVELERS] = {
 /* ── helpers ── */
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color);
 
+
+static void make_sem_name(char *buffer, int node) {
+    snprintf(buffer, SEM_NAME_LEN, "/os_node_sem_%d", node);
+}
 /* ────────────────────────────────────────────────────────────────────────
  * CHILD PROCESS
  * Reads the graph itself, runs Dijkstra, travels, sends messages.
@@ -79,20 +96,58 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
     }
 
     /* Travel: send a message for each node arrival */
+    /* Travel: send a message for each node arrival */
+    /* Travel with node synchronization */
     for (int i = 0; i < pathLen; i++) {
+        int node = path[i];
         int next = (i + 1 < pathLen) ? path[i + 1] : -1;
-        Msg m = { path[i], next };
-        write(writeFd, &m, sizeof(Msg));
 
-        /* Sleep to simulate travel time (except at final destination) */
+        char semName[SEM_NAME_LEN];
+        make_sem_name(semName, node);
+
+        sem_t *nodeSem = sem_open(semName, 0);
+        if (nodeSem == SEM_FAILED) {
+            perror("child sem_open");
+            close(writeFd);
+            exit(1);
+        }
+
+        /* Tell parent: I am waiting outside this node */
+        /* Try to enter the node immediately */
+        if (sem_trywait(nodeSem) == -1) {
+            if (errno == EAGAIN) {
+                /* Node is busy: tell parent that this traveler is waiting */
+                Msg waitingMsg = { MSG_WAITING, node, next };
+                write(writeFd, &waitingMsg, sizeof(Msg));
+
+                /* Now really wait until the node becomes free */
+                sem_wait(nodeSem);
+            } else {
+                perror("sem_trywait");
+                sem_close(nodeSem);
+                close(writeFd);
+                exit(1);
+            }
+        }
+
+        /* Now the traveler is inside the node */
+        Msg enteredMsg = { MSG_ENTERED, node, next };
+        write(writeFd, &enteredMsg, sizeof(Msg));
+        /* Stay inside the node for one full second */
+        sleep(1);
+
+        /* Leave the node */
+        sem_post(nodeSem);
+        sem_close(nodeSem);
+
+        /* Travel on the edge to the next node */
         if (next != -1)
             usleep(NODE_TRAVEL_USEC);
     }
 
     /* Signal fully finished */
-    Msg fin = { -2, -1 };
+    Msg fin = { MSG_FINISHED, -2, -1 };
     write(writeFd, &fin, sizeof(Msg));
-
     close(writeFd);
     exit(0);
 }
@@ -119,7 +174,22 @@ int main(int argc, char **argv) {
     /* ── default node layout ── */
     Point pos[64];
     defaultLayout(n, pos);
+    /* ── create one named semaphore per node ── */
+    for (int i = 0; i < n; i++) {
+        char semName[SEM_NAME_LEN];
+        make_sem_name(semName, i);
 
+        sem_unlink(semName);  /* remove old semaphore if it exists */
+
+        sem_t *sem = sem_open(semName, O_CREAT | O_EXCL, 0600, 1);
+        if (sem == SEM_FAILED) {
+            perror("sem_open");
+            freeGraph(g);
+            return 1;
+        }
+
+        sem_close(sem);
+    }
     /* ── create pipes and fork children ── */
     TravelerState travelers[MAX_TRAVELERS];
     int pipeFds[MAX_TRAVELERS][2]; /* [t][0]=read  [t][1]=write */
@@ -146,6 +216,7 @@ int main(int argc, char **argv) {
                 close(pipeFds[j][0]);
                 close(pipeFds[j][1]);
             }
+
             child_run(pipeFds[t][1], filename, sources[t], dests[t]);
             /* child_run never returns */
         }
@@ -156,12 +227,17 @@ int main(int argc, char **argv) {
         /* make read end non-blocking so GUI loop doesn't stall */
         int flags = fcntl(pipeFds[t][0], F_GETFL, 0);
         fcntl(pipeFds[t][0], F_SETFL, flags | O_NONBLOCK);
-        travelers[t].pid        = pid;
-        travelers[t].readFd     = pipeFds[t][0];
-        travelers[t].src        = sources[t];
-        travelers[t].dst        = dests[t];
-        travelers[t].curNode    = sources[t];
-        travelers[t].done       = false;
+      travelers[t].pid        = pid;
+travelers[t].readFd     = pipeFds[t][0];
+travelers[t].src        = sources[t];
+travelers[t].dst        = dests[t];
+travelers[t].curNode    = sources[t];
+travelers[t].done       = false;
+
+travelers[t].waiting     = false;
+travelers[t].waitingNode = -1;
+        travelers[t].waiting     = false;
+        travelers[t].waitingNode = -1;
 
         travelers[t].guiPos     = pos[sources[t]];
 
@@ -195,17 +271,28 @@ int main(int argc, char **argv) {
                 Msg m;
                 ssize_t r = read(travelers[t].readFd, &m, sizeof(Msg));
                 if (r == sizeof(Msg)) {
-                    if (m.node == -2) {
+                    if (m.type == MSG_FINISHED) {
                         /* child finished */
                         printf("[PID=%d] finished\n", (int)travelers[t].pid);
                         fflush(stdout);
+
                         travelers[t].done = true;
+                        travelers[t].waiting = false;
+                        travelers[t].waitingNode = -1;
+
                         doneCount++;
                         close(travelers[t].readFd);
-                        // if (doneCount == numTravelers)
-                        //     state = STATE_FINISHED;
-                    } else {
-                        /* arrived at node - start smooth movement in GUI */
+
+                    } else if (m.type == MSG_WAITING) {
+                        /* child is waiting outside a node */
+                        travelers[t].waiting = true;
+                        travelers[t].waitingNode = m.node;
+
+                    } else if (m.type == MSG_ENTERED) {
+                        /* child entered the node - start smooth movement in GUI */
+                        travelers[t].waiting = false;
+                        travelers[t].waitingNode = -1;
+
                         if (travelers[t].curNode != m.node) {
                             travelers[t].fromNode = travelers[t].curNode;
                             travelers[t].targetNode = m.node;
@@ -227,6 +314,7 @@ int main(int argc, char **argv) {
                         }
 
                         fflush(stdout);
+
                     }
                 }
                 /* EAGAIN / EWOULDBLOCK = no message yet, that's fine */
@@ -304,12 +392,30 @@ int main(int argc, char **argv) {
         }
 
         /* travelers (dots at last reported node) */
+        /* travelers */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             Vector2 ap = { guiPos[t].x, guiPos[t].y };
-            DrawCircleV(ap, 20, Fade(col, 0.25f));
-            DrawCircleV(ap, 13, col);
-            DrawCircleLinesV(ap, 15, WHITE);
+
+            if (travelers[t].waiting) {
+                Point nodePos = pos[travelers[t].waitingNode];
+
+                float offsetX = 28.0f + (t % 3) * 10.0f;
+                float offsetY = -28.0f - (t % 3) * 10.0f;
+
+                ap.x = nodePos.x + offsetX;
+                ap.y = nodePos.y + offsetY;
+
+                DrawCircleV(ap, 22, Fade(ORANGE, 0.30f));
+                DrawCircleV(ap, 13, ORANGE);
+                DrawCircleLinesV(ap, 15, WHITE);
+                DrawText("WAIT", ap.x + 15, ap.y - 8, 12, ORANGE);
+            } else {
+                DrawCircleV(ap, 20, Fade(col, 0.25f));
+                DrawCircleV(ap, 13, col);
+                DrawCircleLinesV(ap, 15, WHITE);
+            }
+
             DrawText(TextFormat("%d", t), ap.x - 4, ap.y - 8, 14, BLACK);
         }
 
