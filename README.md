@@ -257,7 +257,7 @@ The original Milestone 5 behavior is preserved in `main5.c`.
 
 Milestone 6 is implemented separately in `main6.c` so that the previous milestone remains available and unchanged.
 
-بpd
+
 ### IPC choice: pipes
 Pipes were chosen for their simplicity and zero-setup overhead.
 One pipe per child (child writes, parent reads). The read end is set to
