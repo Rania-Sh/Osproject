@@ -24,4 +24,4 @@ milestone5:
 clean:
 	rm -f dijkstra sim *.o
 milestone6:
-	gcc -Wall -Wextra -std=c11 main6.c animation.c animationui.c dijkstra.c -o sim -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
+	gcc -Wall -Wextra -std=c11 main5.c animation.c animationui.c dijkstra.c -o sim -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
