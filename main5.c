@@ -29,10 +29,20 @@ typedef enum {
     MSG_FINISHED = 3
 } MsgType;
 
+typedef enum {
+    SCHED_CFS = 1,
+    SCHED_SJF = 2
+} SchedulerType;
+static const char* schedulerToString(SchedulerType scheduler) {
+    if (scheduler == SCHED_SJF) return "SJF";
+    return "FCFS";
+}
 typedef struct {
     MsgType type;
     int node;
     int nextNode;
+    int travelerId;
+    int remaining;
 } Msg;
 
 /* ── per-traveler state kept by parent ── */
@@ -78,7 +88,8 @@ static void make_sem_name(char *buffer, int node) {
  * CHILD PROCESS
  * Reads the graph itself, runs Dijkstra, travels, sends messages.
  * ──────────────────────────────────────────────────────────────────────── */
-static void child_run(int writeFd, const char *filename, int src, int dst) {
+static void child_run(int writeFd, const char *filename, int src, int dst,
+                      int travelerId, SchedulerType scheduler) {
     int n;
     Graph *g = loadGraph(filename, &n);
     if (!g) {
@@ -112,6 +123,19 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
          * to nodes reached during the trip.
          */
         if (i > 0) {
+            int remaining = pathLen - i;
+
+            /*
+             * Milestone 7 scheduling effect:
+             * CFS: fair order based on traveler id.
+             * SJF: shorter remaining path gets a smaller delay and tries first.
+             */
+            if (scheduler == SCHED_CFS) {
+                usleep(travelerId * 120000);
+            } else if (scheduler == SCHED_SJF) {
+                usleep(remaining * 120000);
+            }
+
             char semName[SEM_NAME_LEN];
             make_sem_name(semName, node);
 
@@ -128,8 +152,7 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
             if (sem_trywait(nodeSem) == -1) {
                 if (errno == EAGAIN) {
                     /* Node is busy: notify parent that this traveler is waiting */
-                    Msg waitingMsg = { MSG_WAITING, node, next };
-                    write(writeFd, &waitingMsg, sizeof(Msg));
+Msg waitingMsg = { MSG_WAITING, node, next, travelerId, pathLen - i };                    write(writeFd, &waitingMsg, sizeof(Msg));
 
                     /* Wait until the node becomes free */
                     sem_wait(nodeSem);
@@ -146,7 +169,7 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
         }
 
         /* Traveler is now inside the node */
-        Msg enteredMsg = { MSG_ENTERED, node, next };
+        Msg enteredMsg = { MSG_ENTERED, node, next, travelerId, pathLen - i };
         write(writeFd, &enteredMsg, sizeof(Msg));
 
         /*
@@ -155,8 +178,6 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
          */
         if (i > 0) {
             sleep(1);
-            sem_post(nodeSem);
-            sem_close(nodeSem);
         }
 
         /* Small travel delay before next node */
@@ -166,6 +187,15 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
             } else {
                 usleep(NODE_TRAVEL_USEC);   // normal travel delay for the rest
             }
+        }
+
+        /*
+         * Release the node only after the traveler visually had time to leave it.
+         * This prevents two travelers from appearing inside the same node.
+         */
+        if (i > 0) {
+            sem_post(nodeSem);
+            sem_close(nodeSem);
         }
     }
 
@@ -180,11 +210,34 @@ static void child_run(int writeFd, const char *filename, int src, int dst) {
  * PARENT / MAIN
  * ──────────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    SchedulerType scheduler = SCHED_CFS;
+    const char *filename = NULL;
+
+    if (argc == 2) {
+        filename = argv[1];
+    } else if (argc == 4 && strcmp(argv[1], "-schd") == 0) {
+        if (strcmp(argv[2], "fcfs") == 0) {
+
+            scheduler = SCHED_CFS;
+        } else if (strcmp(argv[2], "sjf") == 0) {
+            scheduler = SCHED_SJF;
+        } else {
+            fprintf(stderr, "Unknown scheduler: %s\n", argv[2]);
+            fprintf(stderr, "Usage: %s -schd fcfs <input_file>\n", argv[0]);
+            fprintf(stderr, "Usage: %s -schd sjf <input_file>\n", argv[0]);
+            return 1;
+        }
+
+        filename = argv[3];
+    } else {
         fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
+        fprintf(stderr, "Usage: %s -schd fcfs <input_file>\n", argv[0]);
+        fprintf(stderr, "Usage: %s -schd sjf <input_file>\n", argv[0]);
         return 1;
     }
-    const char *filename = argv[1];
+
+    printf("Milestone 7 scheduler: %s\n", schedulerToString(scheduler));
+    fflush(stdout);
 
     /* ── load graph + travelers ── */
     int n, numTravelers;
@@ -241,8 +294,7 @@ int main(int argc, char **argv) {
                 close(pipeFds[j][1]);
             }
 
-            child_run(pipeFds[t][1], filename, sources[t], dests[t]);
-            /* child_run never returns */
+child_run(pipeFds[t][1], filename, sources[t], dests[t], t, scheduler);            /* child_run never returns */
         }
 
         /* ── parent ── */
@@ -272,8 +324,7 @@ travelers[t].done       = false;
     }
 
     /* ── raylib window ── */
-    InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 5 (IPC pipes)");
-    SetTargetFPS(60);
+InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");    SetTargetFPS(60);
 
     typedef enum { STATE_IDLE, STATE_RUNNING, STATE_FINISHED } AnimState;
     AnimState state = STATE_RUNNING; /* start immediately; children are already running */
@@ -311,8 +362,8 @@ travelers[t].done       = false;
                         travelers[t].waiting = true;
                         travelers[t].waitingNode = m.node;
 
-                        printf("[PID=%d] waiting outside node %d\n",
-                               (int)travelers[t].pid, m.node);
+                        printf("[Scheduler=%s] T%d [PID=%d] waiting outside node %d | remaining=%d\n",
+       schedulerToString(scheduler), t, (int)travelers[t].pid, m.node, m.remaining);
                         fflush(stdout);
 
                     } else if (m.type == MSG_ENTERED) {
@@ -333,11 +384,12 @@ travelers[t].done       = false;
                         travelers[t].curNode = m.node;
 
                         if (m.nextNode == -1) {
-                            printf("[PID=%d] arrived at node %d | DESTINATION\n",
-                                   (int)travelers[t].pid, m.node);
+                            printf("[Scheduler=%s] T%d [PID=%d] entered node %d | DESTINATION\n",
+         schedulerToString(scheduler), t, (int)travelers[t].pid, m.node);
                         } else {
-                            printf("[PID=%d] arrived at node %d | next node: %d\n",
-                                   (int)travelers[t].pid, m.node, m.nextNode);
+                            printf("[Scheduler=%s] T%d [PID=%d] entered node %d | next node: %d | remaining=%d\n",
+         schedulerToString(scheduler), t, (int)travelers[t].pid,
+         m.node, m.nextNode, m.remaining);
                         }
 
                         fflush(stdout);
@@ -424,7 +476,22 @@ travelers[t].done       = false;
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             Vector2 ap = { guiPos[t].x, guiPos[t].y };
 
-            if (travelers[t].waiting) {
+            if (travelers[t].done) {
+                Point dstPos = pos[travelers[t].dst];
+
+                float angle = (6.2831853f * t) / (float)numTravelers;
+                float radius = 42.0f;
+
+                ap.x = dstPos.x + cosf(angle) * radius;
+                ap.y = dstPos.y + sinf(angle) * radius;
+
+                DrawCircleV(ap, 22, Fade(col, 0.25f));
+                DrawCircleV(ap, 14, col);
+                DrawCircleLinesV(ap, 16, WHITE);
+
+                DrawText("DONE", (int)(ap.x - 20), (int)(ap.y - 34), 14, SKYBLUE);
+
+            } else if (travelers[t].waiting) {
                 Point nodePos = pos[travelers[t].waitingNode];
 
                 float offsetX = ((t % 3) - 1) * 22.0f;
