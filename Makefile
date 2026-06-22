@@ -9,19 +9,26 @@ milestone1:
 
 # Milestones 2 & 3 – single traveler GUI
 milestone2: milestone3
+
 milestone3:
 	$(CC) $(CFLAGS) main.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
 
-# Milestone 4 – multiple travelers, parent computes paths
+# Milestone 4 – multiple travelers / GUI
 milestone4:
 	$(CC) $(CFLAGS) main.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
 
-# Milestone 5 – IPC via pipes, children compute their own paths
+# Milestone 5 – IPC / current implementation
 milestone5:
+	$(CC) $(CFLAGS) main5.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
+
+# Milestone 6 – synchronization, implemented in main5.c
+milestone6:
+	$(CC) $(CFLAGS) main5.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
+
+# Milestone 7 – scheduling algorithms, implemented in main5.c
+milestone7:
 	$(CC) $(CFLAGS) main5.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
 
 # Clean up
 clean:
 	rm -f dijkstra sim *.o
-milestone6:
-	gcc -Wall -Wextra -std=c11 main5.c animation.c animationui.c dijkstra.c -o sim -lraylib -lGL -lm -lpthread -ldl -lrt -lX11
