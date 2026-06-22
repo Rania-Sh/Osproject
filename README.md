@@ -262,3 +262,38 @@ Milestone 6 is implemented separately in `main6.c` so that the previous mileston
 Pipes were chosen for their simplicity and zero-setup overhead.
 One pipe per child (child writes, parent reads). The read end is set to
 O_NONBLOCK so the GUI loop never blocks waiting for a child message.
+
+
+## Milestone 7 – Scheduling Algorithms
+
+Milestone 7 adds scheduling support when multiple travelers wait to enter the same graph node.
+
+The program supports two scheduling algorithms:
+
+* `fcfs`: travelers enter according to fair order / arrival order.
+* `sjf`: travelers with a shorter remaining path get priority.
+
+To build Milestone 7:
+
+```bash
+make clean
+make milestone7
+```
+
+To run using FCFS:
+
+```bash
+./sim -schd fcfs test_graph_.txt
+```
+
+To run using SJF:
+
+```bash
+./sim -schd sjf test_graph_.txt
+```
+
+The file `test_graph_.txt` is used to demonstrate the difference between FCFS and SJF.
+
+In the FCFS run, travelers enter the shared node according to order.
+In the SJF run, the green and blue travelers enter before the red traveler because their remaining paths are shorter.
+
