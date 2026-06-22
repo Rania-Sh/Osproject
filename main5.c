@@ -530,8 +530,11 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
         }
 
         /* status */
-        if (state == STATE_RUNNING)
+        if (state == STATE_RUNNING) {
             DrawText("STATUS: RUNNING", 25, 25, 18, LIME);
+            DrawText(TextFormat("SCHEDULER: %s", schedulerToString(scheduler)),
+                     25, 50, 18, YELLOW);
+        }
         else if (state == STATE_FINISHED) {
             DrawText("STATUS: FINISHED", 25, 25, 18, SKYBLUE);
             DrawText("All Travelers Reached Destination!", 200, 590, 22, RAYWHITE);
