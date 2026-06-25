@@ -138,9 +138,9 @@ My work in Milestone 6 was to extend that behavior so that travelers cannot ente
 
 ## Files I Worked On
 
-### `main6.c`
+### `main5.c`
 
-I created and worked on `main6.c` as the implementation file for Milestone 6.
+I created and worked on `main5.c` as the implementation file for Milestone 6.
 
 This file is based on the working Milestone 5 logic, but I added synchronization logic using POSIX named semaphores.
 
@@ -150,7 +150,7 @@ I added a new build target:
 
 ```makefile
 milestone6:
-	$(CC) $(CFLAGS) main6.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
+	$(CC) $(CFLAGS) main5.c animation.c animationui.c dijkstra.c -o sim $(LIBS)
 ```
 
 This allows Milestone 6 to be built using:
