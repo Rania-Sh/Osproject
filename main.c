@@ -1,185 +1,247 @@
 #include "raylib.h"
 #include "animationui.h"
 #include "animation.h"
-#include <stdio.h>
-#include <math.h>
-#include <signal.h>
-#include <stdlib.h>
-#include <unistd.h>
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/wait.h>
 
+/* ── external declarations ── */
 int dijkstra(Graph *g, int src, int dst, int *path);
-#define SCREEN_W 900
-#define SCREEN_H 650
+
+/* ── constants ── */
+#define SCREEN_W     900
+#define SCREEN_H     650
 #define MAX_TRAVELERS 16
+#define NODE_TRAVEL_USEC 800000   /* 0.8 s per node hop in child */
 
-typedef enum {
-    STATE_IDLE,
-    STATE_RUNNING,
-    STATE_PAUSED,
-    STATE_FINISHED
-} AnimState;
+/* ── IPC message ── */
 
-/* ── צבעים שונים לכל נוסע ── */
+#define MSG_FINISHED_NODE -2
+#define MSG_NO_PATH_NODE  -3
+
+typedef struct {
+    int node;      /* current node, -2 = finished, -3 = no path */
+    int nextNode;  /* next node (-1 = destination / special msg) */
+} Msg;
+
+/* ── per-traveler state kept by parent ── */
+typedef struct {
+    pid_t  pid;
+    int    readFd;       /* parent's read end of pipe */
+    int    src, dst;
+    int    curNode;      /* last reported node        */
+    bool   done;
+    bool   noPath;
+    /* For GUI: we lerp to the node position when we get a message */
+    Point  guiPos;
+    int    targetNode;
+} TravelerState;
+
+/* ── colors ── */
 static Color TRAVELER_COLORS[MAX_TRAVELERS] = {
-    {220,  50,  50, 255},  /* אדום       */
-    { 50, 200,  50, 255},  /* ירוק       */
-    { 50, 130, 255, 255},  /* כחול       */
-    {255, 200,   0, 255},  /* צהוב       */
-    {200,  50, 220, 255},  /* סגול       */
-    {  0, 220, 200, 255},  /* טורקיז     */
-    {255, 130,   0, 255},  /* כתום       */
-    {255, 100, 180, 255},  /* ורוד        */
-    {100, 255, 130, 255},  /* ירוק בהיר  */
-    {130, 180, 255, 255},  /* כחול בהיר  */
-    {255,  80,  80, 255},
-    { 80, 255, 255, 255},
-    {255, 255,  80, 255},
-    {180,  80, 255, 255},
-    {255, 180,  80, 255},
-    { 80, 255, 180, 255},
+    {220,  50,  50, 255}, {50,  200,  50, 255},
+    { 50, 130, 255, 255}, {255, 200,   0, 255},
+    {200,  50, 220, 255}, {  0, 220, 200, 255},
+    {255, 130,   0, 255}, {255, 100, 180, 255},
+    {100, 255, 130, 255}, {130, 180, 255, 255},
+    {255,  80,  80, 255}, { 80, 255, 255, 255},
+    {255, 255,  80, 255}, {180,  80, 255, 255},
+    {255, 180,  80, 255}, { 80, 255, 180, 255},
 };
 
+/* ── helpers ── */
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color);
 
+/* ────────────────────────────────────────────────────────────────────────
+ * CHILD PROCESS
+ * Reads the graph itself, runs Dijkstra, travels, sends messages.
+ * ──────────────────────────────────────────────────────────────────────── */
+static void child_run(int writeFd, const char *filename, int src, int dst) {
+    int n;
+    Graph *g = loadGraph(filename, &n);
+    if (!g) {
+        close(writeFd);
+        exit(1);
+    }
+
+    int path[64];
+    int pathLen = dijkstra(g, src, dst, path);
+    freeGraph(g);
+
+   if (pathLen == 0) {
+    Msg noPathMsg = { MSG_NO_PATH_NODE, -1 };
+    write(writeFd, &noPathMsg, sizeof(Msg));
+
+    close(writeFd);
+    exit(0);
+}
+
+    /* Travel: send a message for each node arrival */
+    for (int i = 0; i < pathLen; i++) {
+        int next = (i + 1 < pathLen) ? path[i + 1] : -1;
+        Msg m = { path[i], next };
+        write(writeFd, &m, sizeof(Msg));
+
+        /* Sleep to simulate travel time (except at final destination) */
+        if (next != -1)
+            usleep(NODE_TRAVEL_USEC);
+    }
+
+    /* Signal fully finished */
+Msg fin = { MSG_FINISHED_NODE, -1 };    write(writeFd, &fin, sizeof(Msg));
+
+    close(writeFd);
+    exit(0);
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * PARENT / MAIN
+ * ──────────────────────────────────────────────────────────────────────── */
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
         return 1;
     }
+    const char *filename = argv[1];
 
-    /* ── קריאת גרף ונוסעים מהקובץ ── */
-    int n;
-    int numTravelers;
+    /* ── load graph + travelers ── */
+    int n, numTravelers;
     int sources[MAX_TRAVELERS], dests[MAX_TRAVELERS];
-
-    Graph *g = loadGraphAndTravelers(argv[1], &n, &numTravelers, sources, dests);
+    Graph *g = loadGraphAndTravelers(filename, &n, &numTravelers, sources, dests);
     if (!g) {
-        fprintf(stderr, "Failed to load graph from %s\n", argv[1]);
+        fprintf(stderr, "Failed to load graph from %s\n", filename);
         return 1;
     }
 
-    /* ── חישוב מסלולי דייקסטרה לכל נוסע (האב עושה הכל) ── */
-    int   paths[MAX_TRAVELERS][64];
-    int   pathLens[MAX_TRAVELERS];
+    /* ── default node layout ── */
     Point pos[64];
     defaultLayout(n, pos);
 
-    AnimationPath *anims[MAX_TRAVELERS];
-    Point          agents[MAX_TRAVELERS];
+    /* ── create pipes and fork children ── */
+    TravelerState travelers[MAX_TRAVELERS];
+    int pipeFds[MAX_TRAVELERS][2]; /* [t][0]=read  [t][1]=write */
 
     for (int t = 0; t < numTravelers; t++) {
-        pathLens[t] = dijkstra(g, sources[t], dests[t], paths[t]);
-        if (pathLens[t] == 0) {
-            fprintf(stderr, "No path for traveler %d (%d->%d)\n",
-                    t, sources[t], dests[t]);
+        if (pipe(pipeFds[t]) < 0) {
+            perror("pipe");
             freeGraph(g);
             return 1;
         }
-        anims[t]  = buildAnimationPath(g, paths[t], pathLens[t], pos);
-        agents[t] = pos[paths[t][0]];
-    }
 
-    /* ── יצירת תהליכי הבנים (fork) ── */
-    pid_t childPids[MAX_TRAVELERS];
-
-    for (int t = 0; t < numTravelers; t++) {
         pid_t pid = fork();
         if (pid < 0) {
-            perror("fork failed");
+            perror("fork");
             freeGraph(g);
             return 1;
         }
+
         if (pid == 0) {
-            /* ── תהליך בן ── */
-            printf("[%d] started\n", getpid());
-            fflush(stdout);
-            /* הבן ישן עד שהאב ישלח לו SIGTERM בסיום מסלולו */
-            while (1) pause();
-            exit(0);
+            /* ── child ── */
+            close(pipeFds[t][0]); /* close read end in child */
+            /* close other travelers' pipe ends we inherited */
+            for (int j = 0; j < t; j++) {
+                close(pipeFds[j][0]);
+                close(pipeFds[j][1]);
+            }
+            child_run(pipeFds[t][1], filename, sources[t], dests[t]);
+            /* child_run never returns */
         }
-        /* האב שומר את ה-PID */
-        childPids[t] = pid;
+
+        /* ── parent ── */
+        close(pipeFds[t][1]); /* close write end in parent */
+
+        /* make read end non-blocking so GUI loop doesn't stall */
+        int flags = fcntl(pipeFds[t][0], F_GETFL, 0);
+        fcntl(pipeFds[t][0], F_SETFL, flags | O_NONBLOCK);
+
+        travelers[t].pid        = pid;
+        travelers[t].readFd     = pipeFds[t][0];
+        travelers[t].src        = sources[t];
+        travelers[t].dst        = dests[t];
+        travelers[t].curNode    = sources[t];
+        travelers[t].done       = false;
+        travelers[t].noPath     = false;
+        travelers[t].guiPos     = pos[sources[t]];
+        travelers[t].targetNode = sources[t];
     }
 
-    /* ── לולאת raylib (רק האב) ── */
-    InitWindow(SCREEN_W, SCREEN_H, "Graph Animation System - Multi Traveler");
+    /* ── raylib window ── */
+    InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 5 (IPC pipes)");
     SetTargetFPS(60);
 
-    AnimState state = STATE_IDLE;
-    bool finished[MAX_TRAVELERS];
-    bool signalSent[MAX_TRAVELERS];
-    for (int t = 0; t < numTravelers; t++) {
-        finished[t]   = false;
-        signalSent[t] = false;
-    }
+    typedef enum { STATE_IDLE, STATE_RUNNING, STATE_FINISHED } AnimState;
+    AnimState state = STATE_RUNNING; /* start immediately; children are already running */
 
-    Rectangle btnAction  = {  25, 25, 120, 40 };
-    Rectangle btnRestart = {  25, 75, 120, 40 };
+    int doneCount = 0;
+
+    /* GUI lerp state per traveler */
+    Point guiPos[MAX_TRAVELERS];
+    for (int t = 0; t < numTravelers; t++)
+        guiPos[t] = pos[sources[t]];
 
     while (!WindowShouldClose()) {
-        float dt = GetFrameTime();
-        Vector2 mousePos    = GetMousePosition();
-        bool hoverAction    = CheckCollisionPointRec(mousePos, btnAction);
-        bool hoverRestart   = CheckCollisionPointRec(mousePos, btnRestart);
-
-        /* כפתורי Play / Stop / Restart */
+        /* ── poll pipes for messages (non-blocking) ── */
         if (state == STATE_RUNNING) {
-            if (drawButton(btnAction, "Stop", ORANGE, WHITE, hoverAction))
-                state = STATE_PAUSED;
-        } else {
-            if (drawButton(btnAction, "Play", LIME, DARKGRAY, hoverAction)) {
-                if (state == STATE_FINISHED) {
-                    /* איפוס כל הנוסעים */
-                    for (int t = 0; t < numTravelers; t++) {
-                        anims[t]->currentStep = 0;
-                        anims[t]->elapsed     = 0.0f;
-                        anims[t]->finished    = false;
-                        agents[t]             = pos[paths[t][0]];
-                        finished[t]           = false;
-                    }
-                }
-                state = STATE_RUNNING;
-            }
-        }
-
-        if (drawButton(btnRestart, "Restart", MAROON, WHITE, hoverRestart)) {
-            state = STATE_IDLE;
             for (int t = 0; t < numTravelers; t++) {
-                anims[t]->currentStep = 0;
-                anims[t]->elapsed     = 0.0f;
-                anims[t]->finished    = false;
-                agents[t]             = pos[paths[t][0]];
-                finished[t]           = false;
-            }
-        }
+                if (travelers[t].done) continue;
 
-        /* עדכון אנימציות + שליחת סיגנל לבן שסיים */
-        if (state == STATE_RUNNING) {
-            int allDone = 1;
-            for (int t = 0; t < numTravelers; t++) {
-                if (!finished[t]) {
-                    updateAnimation(anims[t], dt, &agents[t]);
-                    if (anims[t]->finished) {
-                        finished[t] = true;
-                        /* שליחת SIGTERM לבן המתאים */
-                        if (!signalSent[t]) {
-                            kill(childPids[t], SIGTERM);
-                            signalSent[t] = true;
+                Msg m;
+                ssize_t r = read(travelers[t].readFd, &m, sizeof(Msg));
+                if (r == sizeof(Msg)) {
+                    if (m.node == MSG_FINISHED_NODE) {
+    /* child finished normally */
+    printf("[PID=%d] finished\n", (int)travelers[t].pid);
+    fflush(stdout);
+
+    travelers[t].done = true;
+    doneCount++;
+    close(travelers[t].readFd);
+
+    if (doneCount == numTravelers)
+        state = STATE_FINISHED;
+
+} else if (m.node == MSG_NO_PATH_NODE) {
+    /* child reports that no path exists from source to destination */
+    printf("[PID=%d] NO PATH from node %d to node %d\n",
+           (int)travelers[t].pid, travelers[t].src, travelers[t].dst);
+    fflush(stdout);
+travelers[t].noPath = true;
+travelers[t].done = true;
+doneCount++;
+    close(travelers[t].readFd);
+
+    if (doneCount == numTravelers)
+        state = STATE_FINISHED;
+
+} else {
+                        /* arrived at node */
+                        guiPos[t] = pos[m.node];
+                        travelers[t].curNode = m.node;
+                        if (m.nextNode == -1) {
+                            printf("[PID=%d] arrived at node %d | DESTINATION\n",
+                                   (int)travelers[t].pid, m.node);
+                        } else {
+                            printf("[PID=%d] arrived at node %d | next node: %d\n",
+                                   (int)travelers[t].pid, m.node, m.nextNode);
                         }
+                        fflush(stdout);
                     }
-                    allDone = 0;
                 }
+                /* EAGAIN / EWOULDBLOCK = no message yet, that's fine */
             }
-            if (allDone) state = STATE_FINISHED;
         }
 
-        /* ── ציור ── */
+        /* ── draw ── */
         BeginDrawing();
         ClearBackground((Color){ 20, 30, 45, 255 });
 
-        /* קווי גרף */
+        /* graph edges */
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
                 if (g->weights[i][j] > 0) {
@@ -193,85 +255,77 @@ int main(int argc, char **argv) {
                     float midY = (start.y + end.y) / 2.0f;
                     float ox = (len != 0.0f) ? -dy/len * 22.0f : 0.0f;
                     float oy = (len != 0.0f) ?  dx/len * 22.0f : 0.0f;
-
                     const char *wt = TextFormat("%d", g->weights[i][j]);
                     int fs = 18, tw = MeasureText(wt, fs);
-                    DrawRectangle(midX+ox-tw/2-5, midY+oy-fs/2-3, tw+10, fs+6, Fade(BLACK,0.75f));
+                    DrawRectangle(midX+ox-tw/2-5, midY+oy-fs/2-3, tw+10, fs+6,
+                                  Fade(BLACK, 0.75f));
                     DrawText(wt, midX+ox-tw/2, midY+oy-fs/2, fs, YELLOW);
                 }
             }
         }
 
-        /* מסלולי כל הנוסעים (צבע שונה לכל אחד) */
-        for (int t = 0; t < numTravelers; t++) {
-            Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
-            Color dark = Fade(col, 0.4f);
-            for (int k = 0; k < pathLens[t] - 1; k++) {
-                int from = paths[t][k], to = paths[t][k+1];
-                Vector2 start = { pos[from].x, pos[from].y };
-                Vector2 end   = { pos[to].x,   pos[to].y   };
-                DrawArrowLine(start, end, 7.0f, dark);
-                DrawArrowLine(start, end, 4.0f, col);
-            }
-        }
-
-        /* צמתים */
+        /* nodes */
         for (int i = 0; i < n; i++) {
             DrawCircle(pos[i].x, pos[i].y, 20, RAYWHITE);
             DrawCircleLines(pos[i].x, pos[i].y, 15, LIGHTGRAY);
             DrawText(TextFormat("%d", i), pos[i].x - 6, pos[i].y - 8, 18, BLACK);
         }
 
-        /* סוכנים — כל נוסע בצבע שלו */
+        /* travelers (dots at last reported node) */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
-            Vector2 ap = { agents[t].x, agents[t].y };
+            Vector2 ap = { guiPos[t].x, guiPos[t].y };
             DrawCircleV(ap, 20, Fade(col, 0.25f));
             DrawCircleV(ap, 13, col);
             DrawCircleLinesV(ap, 15, WHITE);
             DrawText(TextFormat("%d", t), ap.x - 4, ap.y - 8, 14, BLACK);
         }
 
-        /* מקרא צבעים בצד ימין */
+        /* legend */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             int legendY = 25 + t * 28;
             DrawCircle(SCREEN_W - 130, legendY + 10, 10, col);
-            DrawText(TextFormat("T%d: %d->%d [PID:%d]",
-                                t, sources[t], dests[t], (int)childPids[t]),
+            const char *statusText = "";
+            if (travelers[t].noPath) {
+                statusText = " NO PATH";
+            } else if (travelers[t].done) {
+                statusText = " DONE";
+            }
+
+            DrawText(TextFormat("T%d: %d->%d [PID:%d]%s",
+                                t, travelers[t].src, travelers[t].dst,
+                                (int)travelers[t].pid,
+                                statusText),
                      SCREEN_W - 115, legendY, 14, col);
         }
 
-        /* סטטוס */
+        /* status */
         if (state == STATE_RUNNING)
-            DrawText("STATUS: RUNNING",  160, 35, 18, LIME);
-        else if (state == STATE_PAUSED)
-            DrawText("STATUS: PAUSED",   160, 35, 18, ORANGE);
+            DrawText("STATUS: RUNNING", 25, 25, 18, LIME);
         else if (state == STATE_FINISHED) {
-            DrawText("STATUS: FINISHED", 160, 35, 18, SKYBLUE);
-            DrawText("All Travelers Reached Destination!", 220, 585, 24, RAYWHITE);
-        } else
-            DrawText("STATUS: READY",    160, 35, 18, LIGHTGRAY);
+            DrawText("STATUS: FINISHED", 25, 25, 18, SKYBLUE);
+            DrawText("All Travelers Finished!", 200, 590, 22, RAYWHITE);
+        }
 
         EndDrawing();
     }
 
-    /* ── האב ממתין לכל הבנים ── */
+    /* ── cleanup ── */
     for (int t = 0; t < numTravelers; t++) {
-        /* שליחת סיגנל לבנים שעדיין לא קיבלו (אם המשתמש סגר חלון) */
-        if (!signalSent[t]) kill(childPids[t], SIGTERM);
-        waitpid(childPids[t], NULL, 0);
+        if (!travelers[t].done) {
+            kill(travelers[t].pid, SIGTERM);
+            close(travelers[t].readFd);
+        }
+        waitpid(travelers[t].pid, NULL, 0);
     }
 
-    /* ── ניקוי ── */
-    for (int t = 0; t < numTravelers; t++)
-        freeAnimationPath(anims[t]);
     freeGraph(g);
     CloseWindow();
     return 0;
 }
 
-/* ── DrawArrowLine (ללא שינוי) ── */
+/* ── DrawArrowLine (unchanged from milestone 4) ── */
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color) {
     DrawLineEx(start, end, thickness, color);
     float dx = end.x - start.x, dy = end.y - start.y;
@@ -281,11 +335,10 @@ void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color) {
     float nodeRadius = 23.0f;
     Vector2 tip  = { end.x - ux*nodeRadius, end.y - uy*nodeRadius };
     float arrowLength = 18.0f, arrowWidth = 10.0f;
-    Vector2 base = { tip.x - ux*arrowLength, tip.y - uy*arrowLength };
+    Vector2 base  = { tip.x - ux*arrowLength, tip.y - uy*arrowLength };
     float px = -uy, py = ux;
     Vector2 left  = { base.x + px*arrowWidth, base.y + py*arrowWidth };
     Vector2 right = { base.x - px*arrowWidth, base.y - py*arrowWidth };
     DrawLineEx(tip, left,  thickness+1.5f, color);
     DrawLineEx(tip, right, thickness+1.5f, color);
 }
-
