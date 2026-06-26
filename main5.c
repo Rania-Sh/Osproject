@@ -11,22 +11,21 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 #include <errno.h>
-/* ── external declarations ── */
+
 int dijkstra(Graph *g, int src, int dst, int *path);
 
-/* ── constants ── */
 #define SCREEN_W     900
 #define SCREEN_H     650
 #define MAX_TRAVELERS 16
 #define NODE_TRAVEL_USEC 1500000
-
 #define MAX_NODES 64
 #define SEM_NAME_LEN 64
-/* ── IPC message ── */
+
 typedef enum {
-    MSG_WAITING = 1,
-    MSG_ENTERED = 2,
-    MSG_FINISHED = 3
+    MSG_WAITING  = 1,
+    MSG_ENTERED  = 2,
+    MSG_FINISHED = 3,
+    MSG_NO_PATH  = 4
 } MsgType;
 
 typedef enum {
@@ -45,19 +44,15 @@ typedef struct {
     int remaining;
 } Msg;
 
-/* ── per-traveler state kept by parent ── */
 typedef struct {
     pid_t  pid;
     int    readFd;
     int    src, dst;
     int    curNode;
     bool   done;
-
     bool   waiting;
     int    waitingNode;
-
     Point  guiPos;
-
     int    fromNode;
     int    targetNode;
     float  moveStartTime;
@@ -65,7 +60,6 @@ typedef struct {
     bool   moving;
 } TravelerState;
 
-/* ── colors ── */
 static Color TRAVELER_COLORS[MAX_TRAVELERS] = {
     {220,  50,  50, 255}, {50,  200,  50, 255},
     { 50, 130, 255, 255}, {255, 200,   0, 255},
@@ -77,17 +71,12 @@ static Color TRAVELER_COLORS[MAX_TRAVELERS] = {
     {255, 180,  80, 255}, { 80, 255, 180, 255},
 };
 
-/* ── helpers ── */
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color);
-
 
 static void make_sem_name(char *buffer, int node) {
     snprintf(buffer, SEM_NAME_LEN, "/os_node_sem_%d", node);
 }
-/* ────────────────────────────────────────────────────────────────────────
- * CHILD PROCESS
- * Reads the graph itself, runs Dijkstra, travels, sends messages.
- * ──────────────────────────────────────────────────────────────────────── */
+
 static void child_run(int writeFd, const char *filename, int src, int dst,
                       int travelerId, SchedulerType scheduler) {
     int n;
@@ -104,32 +93,20 @@ static void child_run(int writeFd, const char *filename, int src, int dst,
     freeGraph(g);
 
     if (pathLen == 0) {
-        Msg fin = { MSG_FINISHED, -2, -1 };
-        write(writeFd, &fin, sizeof(Msg));
+        Msg noPath = { MSG_NO_PATH, src, dst, travelerId, 0 };
+        write(writeFd, &noPath, sizeof(Msg));
         close(writeFd);
         exit(0);
     }
 
-    /* Travel with node synchronization */
     for (int i = 0; i < pathLen; i++) {
         int node = path[i];
         int next = (i + 1 < pathLen) ? path[i + 1] : -1;
-
         sem_t *nodeSem = NULL;
 
-        /*
-         * Do not lock the source node.
-         * The traveler starts there, so synchronization is applied only
-         * to nodes reached during the trip.
-         */
         if (i > 0) {
             int remaining = pathLen - i;
 
-            /*
-             * Milestone 7 scheduling effect:
-             * CFS: fair order based on traveler id.
-             * SJF: shorter remaining path gets a smaller delay and tries first.
-             */
             if (scheduler == SCHED_CFS) {
                 usleep(travelerId * 120000);
             } else if (scheduler == SCHED_SJF) {
@@ -148,18 +125,14 @@ static void child_run(int writeFd, const char *filename, int src, int dst,
                 exit(1);
             }
 
-            /* Try to enter immediately */
             if (sem_trywait(nodeSem) == -1) {
                 if (errno == EAGAIN) {
-                    /* Node is busy: notify parent that this traveler is waiting */
-Msg waitingMsg = { MSG_WAITING, node, next, travelerId, pathLen - i };                    write(writeFd, &waitingMsg, sizeof(Msg));
-
-                    /* Wait until the node becomes free */
+                    Msg waitingMsg = { MSG_WAITING, node, next, travelerId, pathLen - i };
+                    write(writeFd, &waitingMsg, sizeof(Msg));
                     sem_wait(nodeSem);
                 } else {
                     perror("sem_trywait");
                     sem_close(nodeSem);
-
                     Msg fin = { MSG_FINISHED, -2, -1 };
                     write(writeFd, &fin, sizeof(Msg));
                     close(writeFd);
@@ -168,47 +141,33 @@ Msg waitingMsg = { MSG_WAITING, node, next, travelerId, pathLen - i };          
             }
         }
 
-        /* Traveler is now inside the node */
         Msg enteredMsg = { MSG_ENTERED, node, next, travelerId, pathLen - i };
         write(writeFd, &enteredMsg, sizeof(Msg));
 
-        /*
-         * Stay one full second only inside nodes reached during the trip,
-         * not at the initial source node.
-         */
         if (i > 0) {
             sleep(1);
         }
 
-        /* Small travel delay before next node */
         if (next != -1) {
             if (i == 0) {
-                usleep(800000);   // only after the source node, to avoid frozen start
+                usleep(800000);
             } else {
-                usleep(NODE_TRAVEL_USEC);   // normal travel delay for the rest
+                usleep(NODE_TRAVEL_USEC);
             }
         }
 
-        /*
-         * Release the node only after the traveler visually had time to leave it.
-         * This prevents two travelers from appearing inside the same node.
-         */
         if (i > 0) {
             sem_post(nodeSem);
             sem_close(nodeSem);
         }
     }
 
-    /* Signal fully finished */
     Msg fin = { MSG_FINISHED, -2, -1 };
     write(writeFd, &fin, sizeof(Msg));
-
     close(writeFd);
     exit(0);
 }
-/* ────────────────────────────────────────────────────────────────────────
- * PARENT / MAIN
- * ──────────────────────────────────────────────────────────────────────── */
+
 int main(int argc, char **argv) {
     SchedulerType scheduler = SCHED_CFS;
     const char *filename = NULL;
@@ -217,29 +176,22 @@ int main(int argc, char **argv) {
         filename = argv[1];
     } else if (argc == 4 && strcmp(argv[1], "-schd") == 0) {
         if (strcmp(argv[2], "fcfs") == 0) {
-
             scheduler = SCHED_CFS;
         } else if (strcmp(argv[2], "sjf") == 0) {
             scheduler = SCHED_SJF;
         } else {
             fprintf(stderr, "Unknown scheduler: %s\n", argv[2]);
-            fprintf(stderr, "Usage: %s -schd fcfs <input_file>\n", argv[0]);
-            fprintf(stderr, "Usage: %s -schd sjf <input_file>\n", argv[0]);
             return 1;
         }
-
         filename = argv[3];
     } else {
         fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
-        fprintf(stderr, "Usage: %s -schd fcfs <input_file>\n", argv[0]);
-        fprintf(stderr, "Usage: %s -schd sjf <input_file>\n", argv[0]);
         return 1;
     }
 
     printf("Milestone 7 scheduler: %s\n", schedulerToString(scheduler));
     fflush(stdout);
 
-    /* ── load graph + travelers ── */
     int n, numTravelers;
     int sources[MAX_TRAVELERS], dests[MAX_TRAVELERS];
     Graph *g = loadGraphAndTravelers(filename, &n, &numTravelers, sources, dests);
@@ -248,28 +200,24 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ── default node layout ── */
     Point pos[64];
     defaultLayout(n, pos);
-    /* ── create one named semaphore per node ── */
+
     for (int i = 0; i < n; i++) {
         char semName[SEM_NAME_LEN];
         make_sem_name(semName, i);
-
-        sem_unlink(semName);  /* remove old semaphore if it exists */
-
+        sem_unlink(semName);
         sem_t *sem = sem_open(semName, O_CREAT | O_EXCL, 0600, 1);
         if (sem == SEM_FAILED) {
             perror("sem_open");
             freeGraph(g);
             return 1;
         }
-
         sem_close(sem);
     }
-    /* ── create pipes and fork children ── */
+
     TravelerState travelers[MAX_TRAVELERS];
-    int pipeFds[MAX_TRAVELERS][2]; /* [t][0]=read  [t][1]=write */
+    int pipeFds[MAX_TRAVELERS][2];
 
     for (int t = 0; t < numTravelers; t++) {
         if (pipe(pipeFds[t]) < 0) {
@@ -286,36 +234,26 @@ int main(int argc, char **argv) {
         }
 
         if (pid == 0) {
-            /* ── child ── */
-            close(pipeFds[t][0]); /* close read end in child */
-            /* close other travelers' pipe ends we inherited */
+            close(pipeFds[t][0]);
             for (int j = 0; j < t; j++) {
                 close(pipeFds[j][0]);
                 close(pipeFds[j][1]);
             }
-
-child_run(pipeFds[t][1], filename, sources[t], dests[t], t, scheduler);            /* child_run never returns */
+            child_run(pipeFds[t][1], filename, sources[t], dests[t], t, scheduler);
         }
 
-        /* ── parent ── */
-        close(pipeFds[t][1]); /* close write end in parent */
-
-        /* make read end non-blocking so GUI loop doesn't stall */
+        close(pipeFds[t][1]);
         int flags = fcntl(pipeFds[t][0], F_GETFL, 0);
         fcntl(pipeFds[t][0], F_SETFL, flags | O_NONBLOCK);
-      travelers[t].pid        = pid;
-travelers[t].readFd     = pipeFds[t][0];
-travelers[t].src        = sources[t];
-travelers[t].dst        = dests[t];
-travelers[t].curNode    = sources[t];
-travelers[t].done       = false;
-
-
+        travelers[t].pid        = pid;
+        travelers[t].readFd     = pipeFds[t][0];
+        travelers[t].src        = sources[t];
+        travelers[t].dst        = dests[t];
+        travelers[t].curNode    = sources[t];
+        travelers[t].done       = false;
         travelers[t].waiting     = false;
         travelers[t].waitingNode = -1;
-
         travelers[t].guiPos     = pos[sources[t]];
-
         travelers[t].fromNode      = sources[t];
         travelers[t].targetNode    = sources[t];
         travelers[t].moveStartTime = 0.0f;
@@ -323,21 +261,18 @@ travelers[t].done       = false;
         travelers[t].moving        = false;
     }
 
-    /* ── raylib window ── */
-InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");    SetTargetFPS(60);
+    InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");
+    SetTargetFPS(60);
 
     typedef enum { STATE_IDLE, STATE_RUNNING, STATE_FINISHED } AnimState;
-    AnimState state = STATE_RUNNING; /* start immediately; children are already running */
-
+    AnimState state = STATE_RUNNING;
     int doneCount = 0;
 
-    /* GUI lerp state per traveler */
     Point guiPos[MAX_TRAVELERS];
     for (int t = 0; t < numTravelers; t++)
         guiPos[t] = pos[sources[t]];
 
     while (!WindowShouldClose()) {
-        /* ── poll pipes for messages (non-blocking) ── */
         if (state == STATE_RUNNING) {
             for (int t = 0; t < numTravelers; t++) {
                 if (travelers[t].done) continue;
@@ -345,29 +280,33 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
                 Msg m;
                 ssize_t r = read(travelers[t].readFd, &m, sizeof(Msg));
                 if (r == sizeof(Msg)) {
-                    if (m.type == MSG_FINISHED) {
-                        /* child finished */
-                        printf("[PID=%d] finished\n", (int)travelers[t].pid);
+                    if (m.type == MSG_NO_PATH) {
+                        printf("\n*** NO PATH: Traveler %d [PID=%d] has no route from node %d to node %d (graph not fully connected) ***\n\n",
+                               t, (int)travelers[t].pid, m.node, m.nextNode);
                         fflush(stdout);
-
                         travelers[t].done = true;
                         travelers[t].waiting = false;
                         travelers[t].waitingNode = -1;
+                        doneCount++;
+                        close(travelers[t].readFd);
 
+                    } else if (m.type == MSG_FINISHED) {
+                        printf("[PID=%d] finished\n", (int)travelers[t].pid);
+                        fflush(stdout);
+                        travelers[t].done = true;
+                        travelers[t].waiting = false;
+                        travelers[t].waitingNode = -1;
                         doneCount++;
                         close(travelers[t].readFd);
 
                     } else if (m.type == MSG_WAITING) {
-                        /* child is waiting outside a node */
                         travelers[t].waiting = true;
                         travelers[t].waitingNode = m.node;
-
                         printf("[Scheduler=%s] T%d [PID=%d] waiting outside node %d | remaining=%d\n",
-       schedulerToString(scheduler), t, (int)travelers[t].pid, m.node, m.remaining);
+                               schedulerToString(scheduler), t, (int)travelers[t].pid, m.node, m.remaining);
                         fflush(stdout);
 
                     } else if (m.type == MSG_ENTERED) {
-                        /* child entered the node - start smooth movement in GUI */
                         travelers[t].waiting = false;
                         travelers[t].waitingNode = -1;
 
@@ -385,61 +324,46 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
 
                         if (m.nextNode == -1) {
                             printf("[Scheduler=%s] T%d [PID=%d] entered node %d | DESTINATION\n",
-         schedulerToString(scheduler), t, (int)travelers[t].pid, m.node);
+                                   schedulerToString(scheduler), t, (int)travelers[t].pid, m.node);
                         } else {
                             printf("[Scheduler=%s] T%d [PID=%d] entered node %d | next node: %d | remaining=%d\n",
-         schedulerToString(scheduler), t, (int)travelers[t].pid,
-         m.node, m.nextNode, m.remaining);
+                                   schedulerToString(scheduler), t, (int)travelers[t].pid,
+                                   m.node, m.nextNode, m.remaining);
                         }
-
                         fflush(stdout);
                     }
                 }
-                /* EAGAIN / EWOULDBLOCK = no message yet, that's fine */
             }
         }
 
-        //* ── update smooth GUI movement ── */
         for (int t = 0; t < numTravelers; t++) {
             if (travelers[t].moving) {
                 float elapsed = GetTime() - travelers[t].moveStartTime;
                 float alpha = elapsed / travelers[t].moveDuration;
-
                 if (alpha >= 1.0f) {
                     alpha = 1.0f;
                     travelers[t].moving = false;
                 }
-
                 Point a = pos[travelers[t].fromNode];
                 Point b = pos[travelers[t].targetNode];
-
                 guiPos[t].x = a.x + (b.x - a.x) * alpha;
                 guiPos[t].y = a.y + (b.y - a.y) * alpha;
             }
         }
+
         if (state == STATE_RUNNING && doneCount == numTravelers) {
             bool allAtDestinations = true;
             bool anyMoving = false;
-
             for (int t = 0; t < numTravelers; t++) {
-                if (travelers[t].curNode != travelers[t].dst) {
-                    allAtDestinations = false;
-                }
-
-                if (travelers[t].moving) {
-                    anyMoving = true;
-                }
+                if (travelers[t].curNode != travelers[t].dst) allAtDestinations = false;
+                if (travelers[t].moving) anyMoving = true;
             }
-
-            if (allAtDestinations && !anyMoving) {
-                state = STATE_FINISHED;
-            }
+            if (allAtDestinations && !anyMoving) state = STATE_FINISHED;
         }
-        /* ── draw ── */
+
         BeginDrawing();
         ClearBackground((Color){ 20, 30, 45, 255 });
 
-        /* graph edges */
         for (int i = 0; i < n; i++) {
             for (int j = 0; j < n; j++) {
                 if (g->weights[i][j] > 0) {
@@ -455,58 +379,44 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
                     float oy = (len != 0.0f) ?  dx/len * 22.0f : 0.0f;
                     const char *wt = TextFormat("%d", g->weights[i][j]);
                     int fs = 18, tw = MeasureText(wt, fs);
-                    DrawRectangle(midX+ox-tw/2-5, midY+oy-fs/2-3, tw+10, fs+6,
-                                  Fade(BLACK, 0.75f));
+                    DrawRectangle(midX+ox-tw/2-5, midY+oy-fs/2-3, tw+10, fs+6, Fade(BLACK, 0.75f));
                     DrawText(wt, midX+ox-tw/2, midY+oy-fs/2, fs, YELLOW);
                 }
             }
         }
 
-        /* nodes */
         for (int i = 0; i < n; i++) {
             DrawCircle(pos[i].x, pos[i].y, 20, RAYWHITE);
             DrawCircleLines(pos[i].x, pos[i].y, 15, LIGHTGRAY);
             DrawText(TextFormat("%d", i), pos[i].x - 6, pos[i].y - 8, 18, BLACK);
         }
 
-        /* travelers (dots at last reported node) */
-        /* travelers */
-        /* travelers */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             Vector2 ap = { guiPos[t].x, guiPos[t].y };
 
             if (travelers[t].done) {
                 Point dstPos = pos[travelers[t].dst];
-
                 float angle = (6.2831853f * t) / (float)numTravelers;
                 float radius = 42.0f;
-
                 ap.x = dstPos.x + cosf(angle) * radius;
                 ap.y = dstPos.y + sinf(angle) * radius;
-
                 DrawCircleV(ap, 22, Fade(col, 0.25f));
                 DrawCircleV(ap, 14, col);
                 DrawCircleLinesV(ap, 16, WHITE);
-
                 DrawText("DONE", (int)(ap.x - 20), (int)(ap.y - 34), 14, SKYBLUE);
 
             } else if (travelers[t].waiting) {
                 Point nodePos = pos[travelers[t].waitingNode];
-
                 float offsetX = ((t % 3) - 1) * 22.0f;
                 float offsetY = -42.0f;
-
                 ap.x = nodePos.x + offsetX;
                 ap.y = nodePos.y + offsetY;
-
                 Vector2 nodeCenter = { nodePos.x, nodePos.y };
-
                 DrawLineEx(nodeCenter, ap, 2.0f, Fade(ORANGE, 0.55f));
                 DrawCircleV(ap, 24, Fade(ORANGE, 0.35f));
                 DrawCircleV(ap, 15, ORANGE);
                 DrawCircleLinesV(ap, 17, WHITE);
-
                 DrawText("WAIT", (int)(ap.x - 18), (int)(ap.y - 34), 14, ORANGE);
             } else {
                 DrawCircleV(ap, 20, Fade(col, 0.25f));
@@ -517,7 +427,6 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
             DrawText(TextFormat("%d", t), (int)(ap.x - 4), (int)(ap.y - 8), 14, BLACK);
         }
 
-        /* legend */
         for (int t = 0; t < numTravelers; t++) {
             Color col = TRAVELER_COLORS[t % MAX_TRAVELERS];
             int legendY = 25 + t * 28;
@@ -526,38 +435,21 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
                     t, travelers[t].src, travelers[t].dst,
                     (int)travelers[t].pid,
                     travelers[t].done ? " DONE" : (travelers[t].waiting ? " WAITING" : "")),
-         SCREEN_W - 115, legendY, 14, travelers[t].waiting ? ORANGE : col);
+                    SCREEN_W - 115, legendY, 14, travelers[t].waiting ? ORANGE : col);
         }
 
-        /* status */
         if (state == STATE_RUNNING) {
             DrawText("STATUS: RUNNING", 25, 25, 18, LIME);
-            DrawText(TextFormat("SCHEDULER: %s", schedulerToString(scheduler)),
-                     25, 50, 18, YELLOW);
-        }
-        else if (state == STATE_FINISHED) {
+            DrawText(TextFormat("SCHEDULER: %s", schedulerToString(scheduler)), 25, 50, 18, YELLOW);
+        } else if (state == STATE_FINISHED) {
             DrawText("STATUS: FINISHED", 25, 25, 18, SKYBLUE);
             DrawText("All Travelers Reached Destination!", 200, 590, 22, RAYWHITE);
         }
 
         EndDrawing();
     }
-
-    /* ── cleanup ── */
-    for (int t = 0; t < numTravelers; t++) {
-        if (!travelers[t].done) {
-            kill(travelers[t].pid, SIGTERM);
-            close(travelers[t].readFd);
-        }
-        waitpid(travelers[t].pid, NULL, 0);
-    }
-
-    freeGraph(g);
-    CloseWindow();
-    return 0;
 }
 
-/* ── DrawArrowLine (unchanged from milestone 4) ── */
 void DrawArrowLine(Vector2 start, Vector2 end, float thickness, Color color) {
     DrawLineEx(start, end, thickness, color);
     float dx = end.x - start.x, dy = end.y - start.y;
