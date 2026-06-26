@@ -26,7 +26,8 @@ int dijkstra(Graph *g, int src, int dst, int *path);
 typedef enum {
     MSG_WAITING = 1,
     MSG_ENTERED = 2,
-    MSG_FINISHED = 3
+    MSG_FINISHED = 3,
+    MSG_NO_PATH = 4
 } MsgType;
 
 typedef enum {
@@ -104,8 +105,8 @@ static void child_run(int writeFd, const char *filename, int src, int dst,
     freeGraph(g);
 
     if (pathLen == 0) {
-        Msg fin = { MSG_FINISHED, -2, -1 };
-        write(writeFd, &fin, sizeof(Msg));
+        Msg noPath = { MSG_NO_PATH, src, dst, travelerId, -1 };
+        write(writeFd, &noPath, sizeof(Msg));
         close(writeFd);
         exit(0);
     }
@@ -393,6 +394,14 @@ InitWindow(SCREEN_W, SCREEN_H, "Graph Simulation - Milestone 7 (Scheduling)");  
                         }
 
                         fflush(stdout);
+                    }
+                    else if (m.type == MSG_NO_PATH) {          // <-- YOUR NEW BRANCH GOES HERE
+                        printf("[PID=%d] NO PATH FOUND from %d to %d — traveler removed\n",
+                               (int)travelers[t].pid, m.node, m.nextNode);
+                        fflush(stdout);
+                        travelers[t].done = true;
+                        doneCount++;
+                        close(travelers[t].readFd);
                     }
                 }
                 /* EAGAIN / EWOULDBLOCK = no message yet, that's fine */
