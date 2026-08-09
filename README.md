@@ -106,7 +106,7 @@ make milestone3
 make clean
 ```
 
-## Milestone 5 – IPC (Pipes)
+## Milestone 5 – IPC (Pipes) (Hadeel Shehadeh)
 
 ### Compile:
 make milestone5
